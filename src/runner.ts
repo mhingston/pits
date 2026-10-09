@@ -1,4 +1,4 @@
-import { DirectoryBackup, type DirectoryBackupRecord } from "@cloudflare/sandbox";
+import { DirectoryBackup, type DirectoryBackupRecord, type DirectoryBackupGatewayBinding } from "@cloudflare/sandbox";
 import { decide } from "./recovery.mjs";
 import { RUN, STATUS } from "./process-protocol.mjs";
 
@@ -55,7 +55,9 @@ export class SandboxRunner {
     this.storage = ctx.storage;
     this.backups = new DirectoryBackup(
       ctx.container,
-      ctx.exports.DirectoryBackupGateway,
+      // Wrangler types do not yet include this WorkerEntrypoint on Exports;
+      // the gateway is exported by src/index.ts as required by SDK 1.0.
+      (ctx.exports as unknown as { DirectoryBackupGateway: DirectoryBackupGatewayBinding }).DirectoryBackupGateway,
       { binding: "BACKUPS", prefix: "pits-s0/" }
     );
     // A restarted DO does not inherit inactivity timers. PiHarness owns alarms;
@@ -91,7 +93,7 @@ export class SandboxRunner {
   private async sh(argv: string[], cwd?: string): Promise<{ exitCode: number; stdout: string; stderr: string }> {
     const proc = await this.container.exec(argv, cwd ? { cwd } : undefined);
     const out = await proc.output();
-    const decode = (bytes: Uint8Array) => new TextDecoder().decode(bytes);
+    const decode = (bytes: Uint8Array | ArrayBuffer) => new TextDecoder().decode(bytes);
     return { exitCode: out.exitCode, stdout: decode(out.stdout), stderr: decode(out.stderr) };
   }
 
