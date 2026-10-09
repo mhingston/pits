@@ -130,7 +130,10 @@ export class SandboxRunner {
       const original = await this.storage.get<Intent>("intent:" + id);
       if (!original || original.digest !== digest) throw new Error("Command ID reused for different arguments");
       const restoredFloor = await this.storage.get<number>("restore-floor-sequence");
-      if (restoredFloor !== undefined && (receipt.sequence ?? Number.MAX_SAFE_INTEGER) > restoredFloor) {
+      const restoredCeiling = await this.storage.get<number>("restore-ceiling-sequence");
+      if (restoredFloor !== undefined && restoredCeiling !== undefined &&
+          (receipt.sequence ?? Number.MAX_SAFE_INTEGER) > restoredFloor &&
+          (receipt.sequence ?? Number.MAX_SAFE_INTEGER) <= restoredCeiling) {
         return { state: "lost", commandId: id, reason: "Receipt postdates restored workspace; never auto-replay" };
       }
       return receipt;
@@ -287,6 +290,7 @@ export class SandboxRunner {
         await tx.delete("active");
         await tx.put("restore-required", false);
         await tx.put("restore-floor-sequence", point.sequence);
+        await tx.put("restore-ceiling-sequence", await tx.get<number>("command-sequence") ?? 0);
         await tx.put("reconciliation-required", true);
         await tx.put("restored-checkpoint", point);
       });
