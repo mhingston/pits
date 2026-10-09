@@ -78,6 +78,7 @@ export class PitsAgent extends DurableObject<Env> {
   }
   async checkpoint() { return this.runner.checkpoint(); }
   async restore() { return this.runner.restore(); }
+  async readEvidence(path: string) { return this.runner.readEvidence(path); }
   async reconcile(checkpointId: string) { return this.runner.acknowledgeReconciliation(checkpointId); }
   async inspect() { return this.runner.inspect(); }
   async destroyForTest() { return this.runner.destroyForTest(); }
@@ -97,6 +98,11 @@ export default {
     }
     const agent = env.PITS.getByName("s0");
     try {
+      if (pathname === "/api/evidence" && request.method === "GET") {
+        const path = new URL(request.url).searchParams.get("path");
+        if (!path) return new Response("Missing path", { status: 400 });
+        return Response.json(await agent.readEvidence(path));
+      }
       if (pathname === "/api/state" && request.method === "GET") {
         return Response.json(await agent.inspect());
       }
