@@ -2,7 +2,7 @@ import { DirectoryBackup, type DirectoryBackupRecord } from "@cloudflare/sandbox
 import { decide } from "./recovery.mjs";
 
 const ROOT = "/var/lib/pits-processes";
-const WORKSPACE = "/workspace";
+const WORKSPACE = "/workspace/pits"; // Created after startup; directory restore works under wrangler dev.
 const TIMEOUT_MS = 20 * 60_000;
 const MAX_POLL_MS = 120_000;
 const POLL_MS = 750;
@@ -39,12 +39,14 @@ export interface Result {
   stdout?: string;
   stderr?: string;
   reason?: string;
+  sequence?: number;
 }
 interface Checkpoint {
   backup: DirectoryBackupRecord;
   bootId: string;
   commandId: string | null;
   createdAt: number;
+  sequence: number;
 }
 
 export async function commandIdFromTask(taskId: string): Promise<string> {
@@ -88,6 +90,8 @@ export class SandboxRunner {
       });
       await this.container.setInactivityTimeout(TIMEOUT_MS);
     }
+    const directory = await this.sh(["mkdir", "-p", WORKSPACE]);
+    if (directory.exitCode !== 0) throw new Error("Cannot initialise workspace: " + directory.stderr);
     const bootId = (await this.sh(["cat", "/proc/sys/kernel/random/boot_id"])).stdout.trim();
     if (!bootId) throw new Error("Cannot establish container boot identity");
     const previous = await this.storage.get<string>("boot");
@@ -122,7 +126,15 @@ export class SandboxRunner {
     const id = await commandIdFromTask(taskId);
     const digest = await hash(command);
     const receipt = await this.storage.get<Result>("receipt:" + id);
-    if (receipt) return receipt; // Already finished; never dispatch again.
+    if (receipt) {
+      const original = await this.storage.get<Intent>("intent:" + id);
+      if (!original || original.digest !== digest) throw new Error("Command ID reused for different arguments");
+      const restoredFloor = await this.storage.get<number>("restore-floor-sequence");
+      if (restoredFloor !== undefined && (receipt.sequence ?? Number.MAX_SAFE_INTEGER) > restoredFloor) {
+        return { state: "lost", commandId: id, reason: "Receipt postdates restored workspace; never auto-replay" };
+      }
+      return receipt;
+    }
 
     const { bootId } = await this.ensureContainer();
     let intent = await this.storage.get<Intent>("intent:" + id);
@@ -133,10 +145,16 @@ export class SandboxRunner {
       await this.storage.put("restore-required", true);
       return { state: "lost", commandId: id, reason: "Container boot changed; restore and reconcile" };
     }
-    if (await this.storage.get<boolean>("restore-required")) {
-      throw new Error("Workspace restore/reconciliation required before executing another command");
+    if (await this.storage.get<boolean>("restore-required") ||
+        await this.storage.get<boolean>("reconciliation-required")) {
+      throw new Error("Workspace restore and human reconciliation required before executing another command");
     }
 
+    // Stage 0 does not support detached/background processes. This rejects
+    // common patterns, but is NOT a security sandbox; use only controlled probes.
+    if (/(^|[^&])&(?!&)/.test(command) || /\b(nohup|setsid|disown|screen|tmux|crontab|systemctl)\b/.test(command)) {
+      throw new Error("Detached/background shell processes are forbidden in S0");
+    }
     // Persistent single-writer gate shared with workspace checkpointing.
     // The Pi tool additionally requests executionMode: sequential.
     await this.storage.transaction(async tx => {
@@ -185,6 +203,11 @@ export class SandboxRunner {
           stdout: stdout.stdout, stderr: stderr.stdout
         };
         await this.storage.transaction(async tx => {
+          const existing = await tx.get<Result>("receipt:" + id);
+          if (existing) { Object.assign(result, existing); return; }
+          const sequence = (await tx.get<number>("command-sequence") ?? 0) + 1;
+          result.sequence = sequence;
+          await tx.put("command-sequence", sequence);
           await tx.put("receipt:" + id, result);
           await tx.put("last-command", id);
           if (await tx.get<string>("active") === id) await tx.delete("active");
@@ -219,7 +242,8 @@ export class SandboxRunner {
     await this.beginMaintenance();
     try {
       const { bootId } = await this.ensureContainer();
-      if (await this.storage.get<boolean>("restore-required")) {
+      if (await this.storage.get<boolean>("restore-required") ||
+          await this.storage.get<boolean>("reconciliation-required")) {
         throw new Error("Cannot checkpoint a workspace requiring reconciliation");
       }
       // S0 forbids detached children and external workspace writers. The
@@ -230,7 +254,8 @@ export class SandboxRunner {
       const point: Checkpoint = {
         backup, bootId,
         commandId: await this.storage.get<string>("last-command") ?? null,
-        createdAt: Date.now()
+        createdAt: Date.now(),
+        sequence: await this.storage.get<number>("command-sequence") ?? 0
       };
       await this.storage.put("checkpoint", point);
       return point;
@@ -261,12 +286,24 @@ export class SandboxRunner {
       await this.storage.transaction(async tx => {
         await tx.delete("active");
         await tx.put("restore-required", false);
+        await tx.put("restore-floor-sequence", point.sequence);
+        await tx.put("reconciliation-required", true);
         await tx.put("restored-checkpoint", point);
       });
       return point;
     } finally {
       await this.storage.delete("maintenance");
     }
+  }
+
+  async acknowledgeReconciliation(checkpointId: string): Promise<void> {
+    const point = await this.storage.get<Checkpoint>("restored-checkpoint");
+    if (!point || point.backup.id !== checkpointId) throw new Error("Checkpoint mismatch");
+    if (await this.storage.get<boolean>("restore-required")) throw new Error("Restore still required");
+    await this.storage.transaction(async tx => {
+      await tx.put("reconciliation-required", false);
+      await tx.put("reconciled-at", Date.now());
+    });
   }
 
   async inspect() {
@@ -278,6 +315,8 @@ export class SandboxRunner {
       active,
       activeIntent: active ? await this.storage.get<Intent>("intent:" + active) : null,
       restoreRequired: (await this.storage.get<boolean>("restore-required")) ?? false,
+      reconciliationRequired: (await this.storage.get<boolean>("reconciliation-required")) ?? false,
+      commandSequence: await this.storage.get<number>("command-sequence") ?? 0,
       checkpoint: (await this.storage.get<Checkpoint>("checkpoint")) ?? null,
       restoredCheckpoint: (await this.storage.get<Checkpoint>("restored-checkpoint")) ?? null
     };
