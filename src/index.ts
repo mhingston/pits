@@ -15,6 +15,7 @@ interface Env {
   AI: Ai;
   PITS_API_TOKEN: string;
   PITS_ENABLE_FAULTS?: string;
+  PITS_ENABLE_MODEL?: string;
 }
 
 export class PitsAgent extends DurableObject<Env> {
@@ -42,7 +43,8 @@ export class PitsAgent extends DurableObject<Env> {
             name: "sandbox_bash",
             description: "Execute a bounded foreground command in the isolated workspace. Never launch detached processes.",
             parameters: Type.Object({ command: Type.String({ minLength: 1, maxLength: 4096 }) }),
-            replay: "safe", // Safe ONLY by virtue of SandboxRunner's durable deduplication.
+            // Re-enable safe replay only after the live S0 crash tests pass.
+            replay: "unsafe",
             executionMode: "sequential",
             execute: async ({ command }, api) => {
               const result = await this.runner.execute(String(api.taskId), command);
@@ -76,6 +78,7 @@ export class PitsAgent extends DurableObject<Env> {
   }
   async checkpoint() { return this.runner.checkpoint(); }
   async restore() { return this.runner.restore(); }
+  async reconcile(checkpointId: string) { return this.runner.acknowledgeReconciliation(checkpointId); }
   async inspect() { return this.runner.inspect(); }
   async destroyForTest() { return this.runner.destroyForTest(); }
   async ask(prompt: string) {
@@ -107,7 +110,13 @@ export default {
       }
       if (pathname === "/api/checkpoint") return Response.json(await agent.checkpoint());
       if (pathname === "/api/restore") return Response.json(await agent.restore());
-      if (pathname === "/api/ask") {
+      if (pathname === "/api/reconcile") {
+        const body = await request.json() as { checkpointId?: unknown };
+        if (typeof body.checkpointId !== "string") return new Response("Expected checkpointId", { status: 400 });
+        await agent.reconcile(body.checkpointId);
+        return Response.json({ reconciled: true });
+      }
+      if (pathname === "/api/ask" && env.PITS_ENABLE_MODEL === "true") {
         const body = await request.json() as { prompt?: unknown };
         if (typeof body.prompt !== "string" || !body.prompt.trim() || body.prompt.length > 2000) {
           return new Response("Expected prompt up to 2000 characters", { status: 400 });
