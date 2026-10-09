@@ -284,6 +284,20 @@ export class SandboxRunner {
     }
   }
 
+  async readEvidence(relativePath: string): Promise<{ path: string; text: string }> {
+    // Deliberately read-only so operators can examine a restored workspace
+    // before acknowledging divergence. No shell interpolation.
+    if (!/^[a-zA-Z0-9._/-]{1,200}$/.test(relativePath) ||
+        relativePath.split("/").some(part => part === "." || part === ".." || part === "")) {
+      throw new Error("Invalid evidence path");
+    }
+    await this.ensureContainer();
+    const path = WORKSPACE + "/" + relativePath;
+    const result = await this.sh(["head", "-c", "8192", path]);
+    if (result.exitCode !== 0) throw new Error("Cannot read evidence: " + result.stderr);
+    return { path: relativePath, text: result.stdout };
+  }
+
   async acknowledgeReconciliation(checkpointId: string): Promise<void> {
     const point = await this.storage.get<Checkpoint>("restored-checkpoint");
     if (!point || point.backup.id !== checkpointId) throw new Error("Checkpoint mismatch");
