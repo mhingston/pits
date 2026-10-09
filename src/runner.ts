@@ -1,5 +1,6 @@
 import { DirectoryBackup, type DirectoryBackupRecord } from "@cloudflare/sandbox";
 import { decide } from "./recovery.mjs";
+import { RUN, STATUS } from "./process-protocol.mjs";
 
 const ROOT = "/var/lib/pits-processes";
 const WORKSPACE = "/workspace/pits"; // Created after startup; directory restore works under wrangler dev.
@@ -9,23 +10,6 @@ const POLL_MS = 750;
 
 // Adapted from Cloudflare Sandbox 1.0's background-process recipe.
 // The directory is an atomic reservation. Never delete it within a boot.
-const RUN = [
-  'dir=$1; shift',
-  'setsid sh -c \'echo "$$ $(cat /proc/sys/kernel/random/boot_id)" >"$0/pid"; exec "$@"\' "$dir" "$@" >"$dir/stdout.log" 2>"$dir/stderr.log"',
-  'echo "$?" >"$dir/exit-code.tmp" && mv "$dir/exit-code.tmp" "$dir/exit-code"'
-].join("\n");
-
-const STATUS = [
-  'dir=$1',
-  'current() { read -r pid boot 2>/dev/null <"$1/pid" && [ "$boot" = "$(cat /proc/sys/kernel/random/boot_id)" ]; }',
-  'if [ ! -d "$dir" ]; then echo missing',
-  'elif [ -e "$dir/exit-code" ]; then echo "exited $(cat "$dir/exit-code")"',
-  'elif [ ! -e "$dir/pid" ]; then echo starting',
-  'elif current "$dir" && kill -0 "$pid" 2>/dev/null; then echo "running $pid"',
-  'else echo lost',
-  'fi'
-].join("\n");
-
 interface Intent {
   id: string;
   bootId: string;
