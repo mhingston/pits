@@ -388,6 +388,7 @@ try {
       const faultStartedAt = Date.now();
       const fault = await invokeCheckpointFault(onlyCheckpointFault);
       const after = await state();
+      const stateObservedAt = Date.now();
       record("backup-fault-observation", {
         pass: after.backupInterruptionFiredAt !== null && after.backupInterruptionPartUploaded === true,
         iteration: i + 1, responseStatus: fault.status,
@@ -411,7 +412,8 @@ try {
         checkpointId: after.checkpoint.backup.id, checkpointSha256: after.checkpoint.backup.sha256,
         size: after.checkpoint.backup.size, bootIdBefore: before.boot, bootIdAfter: after.boot,
         interruptionAt: after.backupInterruptionFiredAt, mutationFixtureBytes: 64 * 1024 * 1024,
-        recoveryDurationMs: Date.now() - faultStartedAt
+        recoveryDurationMs: stateObservedAt - after.backupInterruptionFiredAt,
+        faultStartToStateObservedMs: stateObservedAt - faultStartedAt
       });
       // Let the isolated gateway's one-shot response hold expire before the
       // next backup starts; this keeps each multipart interruption distinct.
@@ -889,19 +891,27 @@ try {
 
   for (let i = 0; i < iterations; i++) {
     const beforeBackupAbort = await state();
-    await invokeCheckpointFault("during_backup");
+    const faultStartedAt = Date.now();
+    const fault = await invokeCheckpointFault("during_backup");
     current = await state();
+    const stateObservedAt = Date.now();
     assert.notEqual(current.backupInterruptionFiredAt, null, "controlled interruption fired while backup was in flight");
     assert.ok(current.backupInterruptionFiredAt > (beforeBackupAbort.backupInterruptionFiredAt ?? 0));
+    assert.equal(current.backupInterruptionPartUploaded, true,
+      "interruption follows a successfully stored R2 multipart part");
     assert.equal(current.checkpoint.backup.id, checkpoint.backup.id, "interrupted transfer cannot replace checkpoint metadata");
     assert.equal(current.boot, beforeBackupAbort.boot, "DO restart during backup preserves the container identity");
     record("fault-during-backup", {
-      pass: true, iteration: i + 1, checkpointId: current.checkpoint.backup.id,
+      pass: true, iteration: i + 1, faultResponseStatus: fault.status,
+      checkpointId: current.checkpoint.backup.id,
       sha256: current.checkpoint.backup.sha256, size: current.checkpoint.backup.size,
       bootIdBefore: beforeBackupAbort.boot, bootIdAfter: current.boot,
       interruptionAt: current.backupInterruptionFiredAt, mutationFixtureBytes: 64 * 1024 * 1024,
+      recoveryDurationMs: stateObservedAt - current.backupInterruptionFiredAt,
+      faultStartToStateObservedMs: stateObservedAt - faultStartedAt,
       maintenanceClearedAfterRestart: true
     });
+    await sleep(3_100);
   }
 
   await restoreAndReconcile(checkpoint, [
