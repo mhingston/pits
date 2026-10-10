@@ -48,6 +48,7 @@ interface Env {
   PITS_ENABLE_FAULTS?: string;
   PITS_ENABLE_FIXTURE?: string;
   PITS_ENABLE_MODEL?: string;
+  PITS_TEST_REVISION?: string;
 }
 
 // Keep Sandbox 1.0's real DirectoryBackupGateway and R2 upload path. In the
@@ -243,7 +244,7 @@ export class PitsAgent extends DurableObject<Env> {
     };
   }
   async testStatus() {
-    return loadTestMode(this.ctx.storage);
+    return { ...await loadTestMode(this.ctx.storage), sourceRevision: this.env.PITS_TEST_REVISION ?? null };
   }
   async enableTestMode(mode: TestMode) {
     return storeTestMode(this.ctx.storage, mode);
@@ -310,6 +311,10 @@ export default {
     if (!env.PITS_API_TOKEN || request.headers.get("Authorization") !== "Bearer " + env.PITS_API_TOKEN) {
       return new Response("Unauthorized", { status: 401 });
     }
+    const expectedRevision = request.headers.get("X-PITS-Source-Revision");
+    if (expectedRevision && expectedRevision !== env.PITS_TEST_REVISION) {
+      return Response.json({ error: "Test deployment revision has not converged" }, { status: 409 });
+    }
     const testId = request.headers.get("X-PITS-Test-ID");
     const testControlRequest = pathname === "/api/test/status" || pathname === "/api/test/enable" ||
       pathname === "/api/test/disable";
@@ -328,12 +333,16 @@ export default {
     try {
       if (objectName !== "s0" && !testControlRequest) {
         const mode = await agent.testStatus();
+        if (expectedRevision && mode.sourceRevision !== expectedRevision) {
+          return Response.json({ error: "Test deployment revision has not converged" }, { status: 409 });
+        }
         if (!mode.faultsEnabled && !mode.fixtureEnabled) return new Response("Not found", { status: 404 });
       }
       if (pathname === "/api/test/status" && request.method === "GET") {
         const durableObject = await agent.testStatus();
         return Response.json({
           ...durableObject,
+          workerSourceRevision: env.PITS_TEST_REVISION ?? null,
           workerFaultsEnabled: env.PITS_ENABLE_FAULTS === "true",
           workerFixtureEnabled: env.PITS_ENABLE_FIXTURE === "true",
           objectName,

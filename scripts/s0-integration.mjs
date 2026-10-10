@@ -65,6 +65,7 @@ async function request(path, body, { auth = true, timeoutMs = 190_000 } = {}) {
   if (auth) headers.Authorization = `Bearer ${token}`;
   if (accessCookie) headers.Cookie = `CF_Authorization=${accessCookie}`;
   headers["X-PITS-Test-ID"] = testId;
+  headers["X-PITS-Source-Revision"] = sourceCommit;
   if (body !== undefined) headers["Content-Type"] = "application/json";
   try {
     const response = await fetch(new URL(path, base), {
@@ -76,6 +77,11 @@ async function request(path, body, { auth = true, timeoutMs = 190_000 } = {}) {
     const text = await response.text();
     let parsed;
     try { parsed = JSON.parse(text); } catch { parsed = { text: redact(text).slice(0, 1000) }; }
+    if (response.status === 409 && parsed?.error === "Test deployment revision has not converged") {
+      if (timeoutMs <= 1000) return { status: response.status, body: parsed };
+      await sleep(1000);
+      return request(path, body, { auth, timeoutMs: timeoutMs - 1000 });
+    }
     return { status: response.status, body: parsed };
   } catch (error) {
     return { status: 0, body: { error: error instanceof Error ? error.name : "request-failed" } };
@@ -217,7 +223,8 @@ async function deployTestWorker(faults, fixture) {
       "wrangler", "deploy", "--config", "wrangler.s0-test.jsonc",
       "--name", workerName,
       "--var", `PITS_ENABLE_FAULTS:${faults}`,
-      "--var", `PITS_ENABLE_FIXTURE:${fixture}`
+      "--var", `PITS_ENABLE_FIXTURE:${fixture}`,
+      "--var", `PITS_TEST_REVISION:${sourceCommit}`
     ], { cwd: process.cwd(), env, stdio: ["ignore", "pipe", "pipe"] });
     let output = "";
     let timedOut = false;
@@ -324,7 +331,8 @@ try {
     lastRoutingResponse = { status: response.status, body: response.body };
     const correctRouting = response.status === 200 && response.body.workerFaultsEnabled === true &&
       response.body.workerFixtureEnabled === true && response.body.objectName === `test-${testId}` &&
-      response.body.requestedTestId === testId;
+      response.body.requestedTestId === testId && response.body.workerSourceRevision === sourceCommit &&
+      response.body.sourceRevision === sourceCommit;
     if (correctRouting && !testModeEnabled) {
       const enabledMode = await request("/api/test/enable", {});
       if (enabledMode.status === 200 && enabledMode.body.faultsEnabled === true &&
