@@ -282,8 +282,10 @@ try {
   const fixtureMarker = `replace-pi-${testId}`;
   const fixturePending = request("/api/ask-fixture", { marker: fixtureMarker }).then(response => {
     record("piharness-request-settled", {
-      pass: response.status === 200,
+      pass: response.status === 200 || response.status === 409,
       status: response.status,
+      disposition: response.status === 409 ? "interrupted-or-rejected-before-reattachment" : "completed-before-reattachment",
+      error: typeof response.body?.error === "string" ? redact(response.body.error).slice(0, 500) : null,
       command: resultSummary(response.body?.command)
     });
     return response;
@@ -369,6 +371,12 @@ try {
     await expectStatus(await request("/api/destroy", {}), 200, "replace container during Pi command");
     const initialResult = expectStatus(await initialAsk, 200, "settle Pi command after replacement");
     const recovered = expectStatus(await request("/api/ask-fixture", { marker }), 200, "reattach Pi operation after replacement");
+    record("piharness-container-replacement-result", {
+      pass: recovered.command?.state === "lost",
+      initialStatus: initialResult.command?.state ?? "tool-result-unavailable",
+      classification: recovered.command?.state ?? null,
+      text: redact(recovered.text).slice(0, 300)
+    });
     assert.equal(recovered.command?.state, "lost");
     assert.deepEqual(recovered.command, initialResult.command);
     assert.match(recovered.text, /fixture observed lost/);

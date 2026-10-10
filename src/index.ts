@@ -229,9 +229,10 @@ export class PitsAgent extends DurableObject<Env> {
     if (this.env.PITS_ENABLE_FIXTURE !== "true") throw new Error("Deterministic fixture is disabled");
     if (!/^[a-z0-9-]{1,63}$/.test(marker)) throw new Error("Invalid fixture marker");
     const result = await this.harness.prompt("pits-fixture:" + marker, { operationId: "fixture-" + marker });
-    const toolResult = result.messages
+    const toolResult = (await this.harness.messages())
       .flatMap(entry => entry.model ?? [])
-      .filter(message => message.role === "toolResult" && message.toolName === "sandbox_bash")
+      .filter(message => message.role === "toolResult" && message.toolName === "sandbox_bash" &&
+        message.toolCallId === "pits-fixture-" + marker)
       .reverse()
       .find(message => message.role === "toolResult");
     let command: {
