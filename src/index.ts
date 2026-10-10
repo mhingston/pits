@@ -7,6 +7,7 @@ import { PiHarness } from "agents/harness/pi";
 import { createAI } from "agents/models/pi-ai";
 import { SandboxRunner } from "./runner";
 import type { FaultStage } from "./runner";
+import { loadTestMode, storeTestMode, type TestMode } from "./test-mode.mjs";
 
 const FIXTURE_PROMPT = /^pits-fixture:([a-z0-9-]{1,63})$/;
 const PI_REOBSERVE_DEADLINE_MS = 4 * 60_000;
@@ -120,29 +121,26 @@ export class PitsAgent extends DurableObject<Env> {
         ]
       });
       const models = createModels();
-      if (this.env.PITS_ENABLE_FIXTURE === "true") {
-        models.setProvider(this.fixture.provider);
-        this.fixture.setResponses(Array.from({ length: 32 }, () => (context: TranscriptContext) => {
-          const fixture = fixtureText(context);
-          if (!fixture) return fauxAssistantMessage("fixture prompt was not recognised");
-          if (fixture.toolState !== undefined) {
-            if (fixture.toolState !== "exited") {
-              return fauxAssistantMessage(`fixture observed ${fixture.toolState}; filesystem result is unverified and reconciliation is required`);
-            }
-            return fauxAssistantMessage(("fixture complete " + fixture.marker + " ").repeat(18));
+      models.setProvider(this.ai.provider);
+      models.setProvider(this.fixture.provider);
+      this.fixture.setResponses(Array.from({ length: 32 }, () => (context: TranscriptContext) => {
+        const fixture = fixtureText(context);
+        if (!fixture) return fauxAssistantMessage("fixture prompt was not recognised");
+        if (fixture.toolState !== undefined) {
+          if (fixture.toolState !== "exited") {
+            return fauxAssistantMessage(`fixture observed ${fixture.toolState}; filesystem result is unverified and reconciliation is required`);
           }
-          const command = fixture.marker.startsWith("replace-")
-            ? `sleep 15 && printf '%s\\n' ${fixture.marker} >> /workspace/pits/pi-fixture.txt`
-            : `printf '%s\\n' ${fixture.marker} >> /workspace/pits/pi-fixture.txt`;
-          return fauxAssistantMessage(fauxToolCall(
-            "sandbox_bash",
-            { command },
-            { id: "pits-fixture-" + fixture.marker }
-          ), { stopReason: "toolUse" });
-        }));
-      } else {
-        models.setProvider(this.ai.provider);
-      }
+          return fauxAssistantMessage(("fixture complete " + fixture.marker + " ").repeat(18));
+        }
+        const command = fixture.marker.startsWith("replace-")
+          ? `sleep 15 && printf '%s\\n' ${fixture.marker} >> /workspace/pits/pi-fixture.txt`
+          : `printf '%s\\n' ${fixture.marker} >> /workspace/pits/pi-fixture.txt`;
+        return fauxAssistantMessage(fauxToolCall(
+          "sandbox_bash",
+          { command },
+          { id: "pits-fixture-" + fixture.marker }
+        ), { stopReason: "toolUse" });
+      }));
       return Harness.open(storage, { models, registry: this.registry }, context);
     },
     defaults: {
@@ -164,12 +162,12 @@ export class PitsAgent extends DurableObject<Env> {
   // Manual API is deliberately small: S0 can be run without an LLM.
   async runProbe(id: string, command: string, faultAt?: FaultStage) {
     if (!/^[a-z0-9-]{1,63}$/.test(id)) throw new Error("Invalid probe ID");
-    if (faultAt && this.env.PITS_ENABLE_FAULTS !== "true") throw new Error("Fault injection is disabled");
+    if (faultAt && !(await loadTestMode(this.ctx.storage)).faultsEnabled) throw new Error("Fault injection is disabled");
     if (faultAt && CHECKPOINT_FAULT_STAGES.includes(faultAt)) throw new Error("Fault stage only applies to checkpointing");
     return this.runner.execute("probe:" + id, command, faultAt);
   }
   async checkpoint(faultAt?: FaultStage) {
-    if (faultAt && this.env.PITS_ENABLE_FAULTS !== "true") throw new Error("Fault injection is disabled");
+    if (faultAt && !(await loadTestMode(this.ctx.storage)).faultsEnabled) throw new Error("Fault injection is disabled");
     if (faultAt && !CHECKPOINT_FAULT_STAGES.includes(faultAt)) throw new Error("Invalid checkpoint fault stage");
     const session = this.harness.session();
     if (await session.busy()) throw new Error("Pi session must be idle before checkpointing");
@@ -214,20 +212,29 @@ export class PitsAgent extends DurableObject<Env> {
       }
     };
   }
-  async testStatus() {
-    return {
-      faultsEnabled: this.env.PITS_ENABLE_FAULTS === "true",
-      fixtureEnabled: this.env.PITS_ENABLE_FIXTURE === "true"
-    };
+  async testStatus(workerMode: TestMode) {
+    if (workerMode.faultsEnabled || workerMode.fixtureEnabled) {
+      await storeTestMode(this.ctx.storage, workerMode);
+    }
+    return loadTestMode(this.ctx.storage);
   }
-  async destroyForTest() { return this.runner.destroyForTest(); }
+  async disableTestMode() {
+    await storeTestMode(this.ctx.storage, { faultsEnabled: false, fixtureEnabled: false });
+    return loadTestMode(this.ctx.storage);
+  }
+  async destroyForTest() {
+    if (!(await loadTestMode(this.ctx.storage)).faultsEnabled) throw new Error("Fault injection is disabled");
+    return this.runner.destroyForTest();
+  }
   async ask(prompt: string) {
     const result = await this.harness.prompt(prompt);
     return { text: result.text };
   }
   async askFixture(marker: string) {
-    if (this.env.PITS_ENABLE_FIXTURE !== "true") throw new Error("Deterministic fixture is disabled");
+    if (!(await loadTestMode(this.ctx.storage)).fixtureEnabled) throw new Error("Deterministic fixture is disabled");
     if (!/^[a-z0-9-]{1,63}$/.test(marker)) throw new Error("Invalid fixture marker");
+    const session = this.harness.session();
+    await session.setModel(this.fixture.getModel());
     const result = await this.harness.prompt("pits-fixture:" + marker, { operationId: "fixture-" + marker });
     const toolResult = (await this.harness.messages())
       .flatMap(entry => entry.model ?? [])
@@ -260,7 +267,7 @@ export class PitsAgent extends DurableObject<Env> {
     };
   }
   async abortForTest() {
-    if (this.env.PITS_ENABLE_FAULTS !== "true") throw new Error("Fault injection is disabled");
+    if (!(await loadTestMode(this.ctx.storage)).faultsEnabled) throw new Error("Fault injection is disabled");
     this.runner.abortForTest();
   }
 }
@@ -273,9 +280,10 @@ export default {
     if (!env.PITS_API_TOKEN || request.headers.get("Authorization") !== "Bearer " + env.PITS_API_TOKEN) {
       return new Response("Unauthorized", { status: 401 });
     }
+    const testId = request.headers.get("X-PITS-Test-ID");
+    const testControlRequest = pathname === "/api/test/status" || pathname === "/api/test/disable";
     let objectName = "s0";
-    if (env.PITS_ENABLE_FAULTS === "true" && env.PITS_ENABLE_FIXTURE === "true") {
-      const testId = request.headers.get("X-PITS-Test-ID");
+    if ((env.PITS_ENABLE_FAULTS === "true" && env.PITS_ENABLE_FIXTURE === "true") || testControlRequest) {
       if (!testId || !/^[a-z0-9-]{1,63}$/.test(testId)) {
         return new Response("Missing or invalid test object ID", { status: 400 });
       }
@@ -286,7 +294,10 @@ export default {
     const agent = env.PITS.getByName(objectName);
     try {
       if (pathname === "/api/test/status" && request.method === "GET") {
-        const durableObject = await agent.testStatus();
+        const durableObject = await agent.testStatus({
+          faultsEnabled: env.PITS_ENABLE_FAULTS === "true",
+          fixtureEnabled: env.PITS_ENABLE_FIXTURE === "true"
+        });
         return Response.json({
           ...durableObject,
           workerFaultsEnabled: env.PITS_ENABLE_FAULTS === "true",
@@ -294,6 +305,9 @@ export default {
           objectName,
           requestedTestId: request.headers.get("X-PITS-Test-ID")
         });
+      }
+      if (pathname === "/api/test/disable" && request.method === "POST") {
+        return Response.json(await agent.disableTestMode());
       }
       if (pathname === "/api/evidence" && request.method === "GET") {
         const path = new URL(request.url).searchParams.get("path");

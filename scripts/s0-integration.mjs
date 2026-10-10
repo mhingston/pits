@@ -826,10 +826,27 @@ try {
 } finally {
   if (process.env.PITS_URL && token) {
     cleanupAttempted = true;
+    const doMode = await request("/api/test/disable", {});
+    const doModeDisabled = doMode.status === 200 &&
+      doMode.body.faultsEnabled === false && doMode.body.fixtureEnabled === false;
+    record("durable-test-mode-disabled", {
+      pass: doModeDisabled, status: doMode.status,
+      faultsEnabled: doMode.body?.faultsEnabled ?? null,
+      fixtureEnabled: doMode.body?.fixtureEnabled ?? null
+    });
     const disabled = await deployTestWorker(false, false);
-    const pass = disabled.code === 0;
+    let verification;
+    if (disabled.code === 0) {
+      const status = await request("/api/test/status");
+      verification = status.status === 200 && status.body.faultsEnabled === false &&
+        status.body.fixtureEnabled === false && status.body.workerFaultsEnabled === false &&
+        status.body.workerFixtureEnabled === false && status.body.objectName === `test-${testId}`;
+    }
+    const pass = disabled.code === 0 && doModeDisabled && verification === true;
     record("fault-injection-disabled", {
       pass, deploymentExitCode: disabled.code, timedOut: disabled.timedOut,
+      durableModeVerifiedDisabled: doModeDisabled,
+      postDeploySwitchesVerifiedDisabled: verification === true,
       output: disabled.output
     });
     if (!pass) {
