@@ -305,7 +305,7 @@ export class PitsAgent extends DurableObject<Env> {
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const pathname = new URL(request.url).pathname;
     if (pathname === "/health") return Response.json({ service: "pits-s0" });
     // Fail closed: no default development token, no unauthenticated sandbox exec.
@@ -330,7 +330,13 @@ export default {
         return new Response("Missing or invalid test object ID", { status: 400 });
       }
     }
-    const agent = env.PITS.getByName(objectName);
+    // Loopback uses this Worker's exported class. The declarative export owns
+    // the same stable SQLite namespace; an env binding may retain an older
+    // target implementation during a code-changing deployment.
+    const namespace = (ctx.exports as unknown as {
+      PitsAgent: DurableObjectNamespace<PitsAgent>
+    }).PitsAgent;
+    const agent = namespace.getByName(objectName);
     try {
       if (objectName !== "s0" && !testControlRequest) {
         const mode = await agent.testStatus();
