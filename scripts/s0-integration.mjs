@@ -13,6 +13,7 @@ const workerName = process.env.PITS_WORKER_NAME ?? "pits-s0-test-recovery";
 const predeployed = process.env.PITS_TEST_PREDEPLOYED === "true";
 const iterations = Number(process.env.PITS_ITERATIONS ?? 10);
 const onlyFaultStage = process.env.PITS_TEST_ONLY_FAULT_STAGE;
+const onlyCheckpointFault = process.env.PITS_TEST_ONLY_CHECKPOINT_FAULT;
 const testId = process.env.PITS_TEST_ID ??
   `${new Date().toISOString().replace(/[^0-9]/g, "").slice(0, 14)}-${randomBytes(4).toString("hex")}`;
 const artifactPath = resolve(process.env.PITS_EVIDENCE ?? `artifacts/s0-${testId}.jsonl`);
@@ -23,6 +24,9 @@ assert.ok(token && token.length >= 32, "Set PITS_API_TOKEN to the locally held t
 assert.ok(Number.isInteger(iterations) && iterations >= 10 && iterations <= 100, "PITS_ITERATIONS must be 10..100");
 assert.ok(onlyFaultStage === undefined || onlyFaultStage === "after_exit_before_receipt",
   "PITS_TEST_ONLY_FAULT_STAGE currently supports after_exit_before_receipt only");
+assert.ok(onlyCheckpointFault === undefined || onlyCheckpointFault === "during_backup",
+  "PITS_TEST_ONLY_CHECKPOINT_FAULT currently supports during_backup only");
+assert.ok(!(onlyFaultStage && onlyCheckpointFault), "Choose only one focused test mode");
 const base = new URL(baseUrl);
 assert.equal(base.protocol, "https:", "Live integration tests require HTTPS");
 assert.ok(!["localhost", "127.0.0.1", "::1"].includes(base.hostname), "Local emulation is not live Cloudflare evidence");
@@ -356,6 +360,54 @@ try {
         bootIdAfter: after.boot, recoveryDurationMs: recovered.recoveryDurationMs
       });
     }
+  } else if (onlyCheckpointFault) {
+    const marker = `checkpoint-only-${testId}`;
+    const path = "checkpoint-only.txt";
+    const initial = expectStatus(await request("/api/probe", {
+      id: `checkpoint-only-${testId}`, command: appendCommand(marker, path)
+    }), 200, "create checkpoint-only baseline");
+    assert.equal(initial.state, "exited");
+    const baselineHash = sha256(await evidence(path));
+    const checkpoint = expectStatus(await request("/api/checkpoint", {}), 200, "checkpoint-only baseline");
+    record("checkpoint-only-baseline", {
+      pass: true, checkpointId: checkpoint.backup.id, checkpointSha256: checkpoint.backup.sha256,
+      size: checkpoint.backup.size, fileHash: baselineHash, bootId: checkpoint.bootId ?? null
+    });
+    for (let i = 0; i < iterations; i++) {
+      const before = await state();
+      const fault = await invokeCheckpointFault(onlyCheckpointFault);
+      const after = await state();
+      assert.notEqual(after.backupInterruptionFiredAt, null,
+        "controlled interruption fired while the DirectoryBackup transfer was in flight");
+      assert.ok(after.backupInterruptionFiredAt > (before.backupInterruptionFiredAt ?? 0),
+        "each backup interruption is independently observed");
+      assert.equal(after.checkpoint.backup.id, checkpoint.backup.id,
+        "interrupted transfer cannot replace committed checkpoint metadata");
+      assert.equal(after.checkpoint.backup.sha256, checkpoint.backup.sha256);
+      assert.equal(after.boot, before.boot, "DO restart during backup preserves container identity");
+      record("fault-during-backup", {
+        pass: true, iteration: i + 1, faultResponseStatus: fault.status,
+        checkpointId: after.checkpoint.backup.id, checkpointSha256: after.checkpoint.backup.sha256,
+        size: after.checkpoint.backup.size, bootIdBefore: before.boot, bootIdAfter: after.boot,
+        interruptionAt: after.backupInterruptionFiredAt, mutationFixtureBytes: 64 * 1024 * 1024,
+        recoveryDurationMs: Date.now() - before.backupInterruptionFiredAt
+      });
+    }
+    await restoreAndReconcile(checkpoint, [[path, baselineHash]]);
+    assert.equal(await evidence("backup-interruption-fixture.bin"), undefined,
+      "backup mutation fixture is absent after restoring the committed checkpoint");
+    const gated = await request("/api/probe", {
+      id: `checkpoint-only-gate-${testId}`, command: appendCommand("checkpoint-gated", "checkpoint-gated.txt")
+    });
+    assert.equal(gated.status, 409, "workspace remains write-blocked until explicit reconciliation");
+    await expectStatus(await request("/api/reconcile", { checkpointId: checkpoint.backup.id }), 200,
+      "reconcile checkpoint-only restore");
+    const resumed = expectStatus(await request("/api/probe", {
+      id: `checkpoint-only-resumed-${testId}`,
+      command: appendCommand("checkpoint-resumed", "checkpoint-resumed.txt")
+    }), 200, "mutation after checkpoint reconciliation");
+    assert.equal(resumed.state, "exited");
+    assert.equal(await markerCount("checkpoint-resumed.txt", "checkpoint-resumed"), 1);
   } else {
   const health = expectStatus(await request("/health", undefined, { auth: false }), 200, "health");
   assert.equal(health.service, "pits-s0");
@@ -833,7 +885,7 @@ try {
   ]);
   assert.equal(await evidence("post-checkpoint.txt"), undefined, "post-checkpoint file is absent after restore");
   assert.equal(await evidence("orphan.txt"), undefined, "interrupted-backup divergence is absent after restore");
-  assert.equal(await evidence(".pits-backup-interruption.bin"), undefined,
+  assert.equal(await evidence("backup-interruption-fixture.bin"), undefined,
     "the mutation fixture created for interrupted backup is absent after restore");
   const invalidated = expectStatus(await request("/api/probe", { id: postId, command: postCommand }), 200, "observe invalidated receipt");
   assert.equal(invalidated.state, "lost");
@@ -905,10 +957,21 @@ try {
     const disabled = await deployTestWorker(false, false);
     let verification;
     if (disabled.code === 0) {
-      const status = await request("/api/test/status");
-      verification = status.status === 200 && status.body.faultsEnabled === false &&
-        status.body.fixtureEnabled === false && status.body.workerFaultsEnabled === false &&
-        status.body.workerFixtureEnabled === false && status.body.objectName === `test-${testId}`;
+      // Worker versions and secrets can take a short time to propagate after a
+      // deploy. Do not declare destructive endpoints disabled on one possibly
+      // stale edge response: require three consecutive observations of both
+      // the Worker switches and the persisted per-DO switches being off.
+      let stableDisabledSamples = 0;
+      const verificationStartedAt = Date.now();
+      while (Date.now() - verificationStartedAt < 30_000 && stableDisabledSamples < 3) {
+        const status = await request("/api/test/status");
+        const disabledAtEdge = status.status === 200 && status.body.faultsEnabled === false &&
+          status.body.fixtureEnabled === false && status.body.workerFaultsEnabled === false &&
+          status.body.workerFixtureEnabled === false && status.body.objectName === `test-${testId}`;
+        stableDisabledSamples = disabledAtEdge ? stableDisabledSamples + 1 : 0;
+        if (stableDisabledSamples < 3) await sleep(500);
+      }
+      verification = stableDisabledSamples === 3;
     }
     const pass = disabled.code === 0 && doModeDisabled && verification === true;
     record("fault-injection-disabled", {

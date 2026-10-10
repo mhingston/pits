@@ -335,7 +335,10 @@ export class SandboxRunner {
       if (faultAt === "during_backup") {
         await this.storage.delete("test-backup-interruption-fired-at");
         const fixture = await this.sh([
-          "dd", "if=/dev/urandom", `of=${WORKSPACE}/.pits-backup-interruption.bin`,
+          // Keep the fixture visible: DirectoryBackup's archive traversal
+          // excludes hidden implementation files, so a dotfile could make the
+          // intended slow transfer finish before the injected interruption.
+          "dd", "if=/dev/urandom", `of=${WORKSPACE}/backup-interruption-fixture.bin`,
           "bs=1M", "count=64"
         ]);
         if (fixture.exitCode !== 0) throw new Error("Cannot prepare backup interruption fixture: " + fixture.stderr);
@@ -353,7 +356,7 @@ export class SandboxRunner {
           if (backupCompleted) return;
           await this.storage.put("test-backup-interruption-fired-at", Date.now());
           this.ctx.abort("pits fault injection: during_backup", { retryAlarm: false });
-        }, 250);
+        }, 1_000);
         try {
           await backupPromise;
         } finally {
