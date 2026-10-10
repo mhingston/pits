@@ -12,6 +12,10 @@ export const STATUS = [
   'elif [ -e "$dir/exit-code" ]; then echo "exited $(cat "$dir/exit-code")"',
   'elif [ ! -e "$dir/pid" ]; then echo starting',
   'elif current "$dir" && kill -0 "$pid" 2>/dev/null; then echo "running $pid"',
+  // The command PID can exit just before its wrapper atomically publishes the
+  // exit code. On the same boot this is a short publication window, not proof
+  // that the process was lost; keep waiting and never redispatch.
+  'elif current "$dir"; then echo starting',
   'else echo lost',
   'fi'
 ].join("\n");

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { isSafeForegroundCommand, RUN, STATUS } from "../src/process-protocol.mjs";
@@ -38,6 +38,22 @@ test("reservation without PID remains starting; do not automatically retry", () 
     const dir = join(root, "cmd"); mkdirSync(dir);
     assert.equal(status(dir), "starting");
     assert.ok(!existsSync(join(dir, "exit-code")));
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("same-boot exited PID without a published exit code remains waitable, not lost", () => {
+  const root = mkdtempSync(join(tmpdir(), "pits-s0-"));
+  try {
+    const dir = join(root, "cmd");
+    mkdirSync(dir);
+    const bootId = execFileSync("cat", ["/proc/sys/kernel/random/boot_id"], { encoding: "utf8" }).trim();
+    const pidMax = Number(execFileSync("cat", ["/proc/sys/kernel/pid_max"], { encoding: "utf8" }).trim());
+    writeFileSync(join(dir, "pid"), `${pidMax + 1} ${bootId}\n`);
+    assert.equal(status(dir), "starting");
+    assert.ok(!existsSync(join(dir, "exit-code")));
+
+    writeFileSync(join(dir, "pid"), `${pidMax + 1} previous-boot\n`);
+    assert.equal(status(dir), "lost", "a boot mismatch remains conclusive process loss");
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
