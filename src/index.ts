@@ -2,6 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import { Type, fauxAssistantMessage, fauxProvider, fauxToolCall, type TranscriptContext } from "@earendil-works/pi-ai";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { createRegistry, defineTool, Harness } from "@earendil-works/pi-durable";
+import { DirectoryBackupGateway as SandboxDirectoryBackupGateway } from "@cloudflare/sandbox";
 import { Lifecycle } from "agents/lifecycle";
 import { PiHarness } from "agents/harness/pi";
 import { createAI } from "agents/models/pi-ai";
@@ -12,6 +13,8 @@ import { loadTestMode, storeTestMode, type TestMode } from "./test-mode.mjs";
 const FIXTURE_PROMPT = /^pits-fixture:([a-z0-9-]{1,63})$/;
 const PI_REOBSERVE_DEADLINE_MS = 4 * 60_000;
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+const BACKUP_FAULT_ARM_KEY = "pits-s0/__test-backup-interruption-arm";
+const BACKUP_FAULT_IN_FLIGHT_KEY = "pits-s0/__test-backup-interruption-in-flight";
 
 function fixtureText(context: TranscriptContext): { marker: string; toolState?: string } | undefined {
   let index = -1;
@@ -37,8 +40,6 @@ function fixtureText(context: TranscriptContext): { marker: string; toolState?: 
   }
 }
 
-export { DirectoryBackupGateway } from "@cloudflare/sandbox";
-
 interface Env {
   PITS: DurableObjectNamespace<PitsAgent>;
   BACKUPS: R2Bucket;
@@ -47,6 +48,27 @@ interface Env {
   PITS_ENABLE_FAULTS?: string;
   PITS_ENABLE_FIXTURE?: string;
   PITS_ENABLE_MODEL?: string;
+}
+
+// Keep Sandbox 1.0's real DirectoryBackupGateway and R2 upload path. In the
+// isolated test deployment only, a one-shot R2 marker holds the first
+// successful multipart-part response so the DO can be deterministically
+// interrupted after bytes reached R2 but before checkpoint metadata commits.
+export class DirectoryBackupGateway extends SandboxDirectoryBackupGateway {
+  override async fetch(request: Request): Promise<Response> {
+    const response = await super.fetch(request);
+    const env = this.env as Env;
+    const props = this.ctx.props as { mode?: string; key?: string; uploadId?: string };
+    const isPartUpload = request.method === "PUT" && new URL(request.url).pathname.startsWith("/parts/");
+    if (response.ok && isPartUpload && props.mode === "write" &&
+        env.PITS_ENABLE_FAULTS === "true" && await env.BACKUPS.head(BACKUP_FAULT_ARM_KEY)) {
+      await env.BACKUPS.put(BACKUP_FAULT_IN_FLIGHT_KEY, JSON.stringify({
+        key: props.key, uploadId: props.uploadId, at: Date.now()
+      }));
+      await delay(3_000);
+    }
+    return response;
+  }
 }
 
 const FAULT_STAGES: readonly FaultStage[] = [
@@ -156,7 +178,7 @@ export class PitsAgent extends DurableObject<Env> {
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    this.runner = new SandboxRunner(ctx);
+    this.runner = new SandboxRunner(ctx, env.BACKUPS);
   }
 
   // Manual API is deliberately small: S0 can be run without an LLM.

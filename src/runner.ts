@@ -11,6 +11,8 @@ import { isSafeForegroundCommand, RUN, STATUS } from "./process-protocol.mjs";
 
 const ROOT = "/var/lib/pits-processes";
 const WORKSPACE = "/workspace/pits"; // Created after startup; directory restore works under wrangler dev.
+const BACKUP_FAULT_ARM_KEY = "pits-s0/__test-backup-interruption-arm";
+const BACKUP_FAULT_IN_FLIGHT_KEY = "pits-s0/__test-backup-interruption-in-flight";
 const TIMEOUT_MS = 20 * 60_000;
 const MAX_POLL_MS = 120_000;
 const POLL_MS = 750;
@@ -44,6 +46,11 @@ interface Checkpoint {
     messageCount: number;
   };
 }
+interface InterruptedBackupUpload {
+  key: string;
+  uploadId: string;
+  at: number;
+}
 
 export type FaultStage =
   | "before_intent"
@@ -71,7 +78,7 @@ export class SandboxRunner {
   private readonly container: Container;
   private readonly storage: DurableObjectStorage;
 
-  constructor(private readonly ctx: DurableObjectState) {
+  constructor(private readonly ctx: DurableObjectState, private readonly backupBucket: R2Bucket) {
     if (!ctx.container) throw new Error("Sandbox container binding is missing");
     this.container = ctx.container;
     this.storage = ctx.storage;
@@ -319,12 +326,34 @@ export class SandboxRunner {
     });
   }
 
+  private async cleanupInterruptedBackupUpload(): Promise<void> {
+    const pending = await this.storage.get<InterruptedBackupUpload>("test-backup-interruption-upload");
+    if (pending) {
+      if (!pending.key.startsWith("pits-s0/") || !pending.uploadId) {
+        throw new Error("Refusing to clean up an invalid interrupted backup upload reference");
+      }
+      try {
+        await this.backupBucket.resumeMultipartUpload(pending.key, pending.uploadId).abort();
+      } catch (error) {
+        // A late container helper may have completed the object after the DO
+        // reset. In that case, remove the unreferenced object; otherwise keep
+        // cleanup fail-closed so an unknown multipart upload is not ignored.
+        if (!(await this.backupBucket.head(pending.key))) throw error;
+      }
+      await this.backupBucket.delete(pending.key);
+      await this.storage.delete("test-backup-interruption-upload");
+    }
+    await this.backupBucket.delete(BACKUP_FAULT_ARM_KEY);
+    await this.backupBucket.delete(BACKUP_FAULT_IN_FLIGHT_KEY);
+  }
+
   async checkpoint(
     faultAt?: FaultStage,
     transcriptAnchor?: Checkpoint["transcriptAnchor"]
   ): Promise<Checkpoint> {
     await this.beginMaintenance();
     try {
+      if (faultAt === "during_backup") await this.cleanupInterruptedBackupUpload();
       const { bootId } = await this.ensureContainer();
       if (await this.storage.get<boolean>("restore-required") ||
           await this.storage.get<boolean>("reconciliation-required")) {
@@ -334,14 +363,15 @@ export class SandboxRunner {
       // active-command gate alone cannot establish their absence.
       if (faultAt === "during_backup") {
         await this.storage.delete("test-backup-interruption-fired-at");
+        await this.storage.delete("test-backup-interruption-upload");
         const fixture = await this.sh([
-          // Keep the fixture visible: DirectoryBackup's archive traversal
-          // excludes hidden implementation files, so a dotfile could make the
-          // intended slow transfer finish before the injected interruption.
+          // Keep a visible fixture outside excluded subtrees; the gateway
+          // marker below proves that it reached an actual R2 multipart part.
           "dd", "if=/dev/urandom", `of=${WORKSPACE}/backup-interruption-fixture.bin`,
           "bs=1M", "count=64"
         ]);
         if (fixture.exitCode !== 0) throw new Error("Cannot prepare backup interruption fixture: " + fixture.stderr);
+        await this.backupBucket.put(BACKUP_FAULT_ARM_KEY, String(Date.now()));
       }
       const options = {
         dir: WORKSPACE, exclude: ["node_modules/", ".cache/"]
@@ -352,21 +382,27 @@ export class SandboxRunner {
         return record;
       });
       if (faultAt === "during_backup") {
-        const timer = setTimeout(async () => {
-          if (backupCompleted) return;
-          await this.storage.put("test-backup-interruption-fired-at", Date.now());
-          this.ctx.abort("pits fault injection: during_backup", { retryAlarm: false });
-        }, 1_000);
-        try {
-          await backupPromise;
-        } finally {
-          clearTimeout(timer);
+        const deadline = Date.now() + 30_000;
+        while (!backupCompleted && Date.now() < deadline) {
+          const inFlight = await this.backupBucket.get(BACKUP_FAULT_IN_FLIGHT_KEY);
+          if (inFlight) {
+            const upload = await inFlight.json<InterruptedBackupUpload>();
+            if (!upload.key?.startsWith("pits-s0/") || !upload.uploadId || !Number.isFinite(upload.at)) {
+              throw new Error("DirectoryBackup gateway published an invalid in-flight R2 upload marker");
+            }
+            await this.storage.put("test-backup-interruption-upload", upload);
+            await this.storage.put("test-backup-interruption-fired-at", upload.at);
+            await this.ctx.abort("pits fault injection: during R2 multipart backup", { retryAlarm: false });
+            await new Promise<void>(() => {});
+          }
+          await delay(50);
         }
-        if (!(await this.storage.get<number>("test-backup-interruption-fired-at"))) {
-          throw new Error("Backup completed before the controlled interruption; increase the fixture size");
+        if (backupCompleted) {
+          const completed = await backupPromise;
+          await this.cleanupInterruptedBackupUpload();
+          throw new Error(`Backup completed before the gateway observed an R2 multipart part (${completed.size} bytes)`);
         }
-        // ctx.abort() should have terminated this invocation before this point.
-        throw new Error("DO interruption did not terminate the active backup");
+        throw new Error("Timed out waiting for DirectoryBackup to upload its first R2 multipart part");
       }
       const backup = await backupPromise;
       await this.injectFault(faultAt, "after_backup_before_checkpoint");
@@ -385,6 +421,7 @@ export class SandboxRunner {
   }
 
   async restore(): Promise<Checkpoint> {
+    await this.cleanupInterruptedBackupUpload();
     // Unlike snapshotting, a restore may follow an interrupted command on a
     // *different* container boot. Never restore over a live known process.
     await this.storage.transaction(async tx => {
@@ -460,6 +497,7 @@ export class SandboxRunner {
       activeIntent: active ? await this.storage.get<Intent>("intent:" + active) : null,
       processObservation,
       backupInterruptionFiredAt: await this.storage.get<number>("test-backup-interruption-fired-at") ?? null,
+      backupInterruptionPartUploaded: Boolean(await this.storage.get<InterruptedBackupUpload>("test-backup-interruption-upload")),
       restoreRequired: (await this.storage.get<boolean>("restore-required")) ?? false,
       reconciliationRequired: (await this.storage.get<boolean>("reconciliation-required")) ?? false,
       commandSequence: await this.storage.get<number>("command-sequence") ?? 0,

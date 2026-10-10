@@ -381,6 +381,8 @@ try {
         "controlled interruption fired while the DirectoryBackup transfer was in flight");
       assert.ok(after.backupInterruptionFiredAt > (before.backupInterruptionFiredAt ?? 0),
         "each backup interruption is independently observed");
+      assert.equal(after.backupInterruptionPartUploaded, true,
+        "the injected interruption occurs after a real R2 multipart part is stored");
       assert.equal(after.checkpoint.backup.id, checkpoint.backup.id,
         "interrupted transfer cannot replace committed checkpoint metadata");
       assert.equal(after.checkpoint.backup.sha256, checkpoint.backup.sha256);
@@ -392,6 +394,9 @@ try {
         interruptionAt: after.backupInterruptionFiredAt, mutationFixtureBytes: 64 * 1024 * 1024,
         recoveryDurationMs: Date.now() - before.backupInterruptionFiredAt
       });
+      // Let the isolated gateway's one-shot response hold expire before the
+      // next backup starts; this keeps each multipart interruption distinct.
+      await sleep(3_100);
     }
     await restoreAndReconcile(checkpoint, [[path, baselineHash]]);
     assert.equal(await evidence("backup-interruption-fixture.bin"), undefined,
@@ -957,21 +962,29 @@ try {
     const disabled = await deployTestWorker(false, false);
     let verification;
     if (disabled.code === 0) {
-      // Worker versions and secrets can take a short time to propagate after a
-      // deploy. Do not declare destructive endpoints disabled on one possibly
-      // stale edge response: require three consecutive observations of both
-      // the Worker switches and the persisted per-DO switches being off.
-      let stableDisabledSamples = 0;
+      // A status request served by a stale Worker version can re-enable the
+      // persisted test mode. First observe three consecutive Worker versions
+      // with their environment switches off; then explicitly clear the DO's
+      // persisted switches once more and verify the combined state.
+      let stableWorkerDisabledSamples = 0;
       const verificationStartedAt = Date.now();
-      while (Date.now() - verificationStartedAt < 30_000 && stableDisabledSamples < 3) {
+      while (Date.now() - verificationStartedAt < 45_000 && stableWorkerDisabledSamples < 3) {
         const status = await request("/api/test/status");
-        const disabledAtEdge = status.status === 200 && status.body.faultsEnabled === false &&
-          status.body.fixtureEnabled === false && status.body.workerFaultsEnabled === false &&
-          status.body.workerFixtureEnabled === false && status.body.objectName === `test-${testId}`;
-        stableDisabledSamples = disabledAtEdge ? stableDisabledSamples + 1 : 0;
-        if (stableDisabledSamples < 3) await sleep(500);
+        const workerDisabledAtEdge = status.status === 200 && status.body.workerFaultsEnabled === false &&
+          status.body.workerFixtureEnabled === false && status.body.objectName === `test-${testId}` &&
+          status.body.requestedTestId === testId;
+        stableWorkerDisabledSamples = workerDisabledAtEdge ? stableWorkerDisabledSamples + 1 : 0;
+        if (stableWorkerDisabledSamples < 3) await sleep(500);
       }
-      verification = stableDisabledSamples === 3;
+      if (stableWorkerDisabledSamples === 3) {
+        const finalMode = await request("/api/test/disable", {});
+        const finalStatus = await request("/api/test/status");
+        verification = finalMode.status === 200 && finalMode.body.faultsEnabled === false &&
+          finalMode.body.fixtureEnabled === false && finalStatus.status === 200 &&
+          finalStatus.body.faultsEnabled === false && finalStatus.body.fixtureEnabled === false &&
+          finalStatus.body.workerFaultsEnabled === false && finalStatus.body.workerFixtureEnabled === false &&
+          finalStatus.body.objectName === `test-${testId}` && finalStatus.body.requestedTestId === testId;
+      }
     }
     const pass = disabled.code === 0 && doModeDisabled && verification === true;
     record("fault-injection-disabled", {
