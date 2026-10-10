@@ -1,11 +1,38 @@
 import { DurableObject } from "cloudflare:workers";
-import { Type } from "@earendil-works/pi-ai";
+import { Type, fauxAssistantMessage, fauxProvider, fauxToolCall, type TranscriptContext } from "@earendil-works/pi-ai";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { createRegistry, defineTool, Harness } from "@earendil-works/pi-durable";
 import { Lifecycle } from "agents/lifecycle";
 import { PiHarness } from "agents/harness/pi";
 import { createAI } from "agents/models/pi-ai";
 import { SandboxRunner } from "./runner";
+import type { FaultStage } from "./runner";
+
+const FIXTURE_PROMPT = /^pits-fixture:([a-z0-9-]{1,63})$/;
+
+function fixtureText(context: TranscriptContext): { marker: string; toolState?: string } | undefined {
+  let index = -1;
+  for (let i = context.messages.length - 1; i >= 0; i--) {
+    if (context.messages[i].role === "user") { index = i; break; }
+  }
+  if (index < 0) return undefined;
+  const content = context.messages[index].content;
+  const text = typeof content === "string" ? content : content.map(block => block.type === "text" ? block.text : "").join("\n");
+  const match = FIXTURE_PROMPT.exec(text.trim());
+  if (!match) return undefined;
+  const toolResult = context.messages.slice(index + 1).find(message =>
+    message.role === "toolResult" && message.toolName === "sandbox_bash");
+  if (!toolResult) return { marker: match[1] };
+  const toolText = typeof toolResult.content === "string"
+    ? toolResult.content
+    : toolResult.content.filter(block => block.type === "text").map(block => block.text).join("\n");
+  try {
+    const result = JSON.parse(toolText) as { state?: unknown };
+    return { marker: match[1], toolState: typeof result.state === "string" ? result.state : "unknown" };
+  } catch {
+    return { marker: match[1], toolState: "unknown" };
+  }
+}
 
 export { DirectoryBackupGateway } from "@cloudflare/sandbox";
 
@@ -15,13 +42,33 @@ interface Env {
   AI: Ai;
   PITS_API_TOKEN: string;
   PITS_ENABLE_FAULTS?: string;
+  PITS_ENABLE_FIXTURE?: string;
   PITS_ENABLE_MODEL?: string;
 }
+
+const FAULT_STAGES: readonly FaultStage[] = [
+  "before_intent", "after_intent", "after_reservation", "after_launch",
+  "after_exit_before_receipt", "after_receipt", "after_backup_before_checkpoint"
+];
 
 export class PitsAgent extends DurableObject<Env> {
   private readonly runner: SandboxRunner;
   readonly ai = createAI({ binding: this.env.AI });
   readonly registry = createRegistry();
+  readonly fixture = fauxProvider({
+    api: "pits-s0-fixture",
+    provider: "pits-s0-fixture",
+    tokensPerSecond: 8,
+    models: [{
+      id: "deterministic",
+      name: "PITS S0 deterministic fixture",
+      reasoning: false,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 4096,
+      maxTokens: 256
+    }]
+  });
 
   readonly harness = new PiHarness({
     harness: async ({ storage, context }) => {
@@ -49,7 +96,7 @@ export class PitsAgent extends DurableObject<Env> {
             execute: async ({ command }, api) => {
               const result = await this.runner.execute(String(api.taskId), command);
               return {
-                output: [{ type: "text", text: JSON.stringify(result) }],
+                content: [{ type: "text", text: JSON.stringify(result) }],
                 isError: result.state !== "exited" || result.exitCode !== 0
               };
             }
@@ -57,10 +104,37 @@ export class PitsAgent extends DurableObject<Env> {
         ]
       });
       const models = createModels();
-      models.setProvider(this.ai.provider);
+      if (this.env.PITS_ENABLE_FIXTURE === "true") {
+        models.setProvider(this.fixture.provider);
+        this.fixture.setResponses(Array.from({ length: 32 }, () => (context: TranscriptContext) => {
+          const fixture = fixtureText(context);
+          if (!fixture) return fauxAssistantMessage("fixture prompt was not recognised");
+          if (fixture.toolState !== undefined) {
+            if (fixture.toolState !== "exited") {
+              return fauxAssistantMessage(`fixture observed ${fixture.toolState}; filesystem result is unverified and reconciliation is required`);
+            }
+            return fauxAssistantMessage(("fixture complete " + fixture.marker + " ").repeat(18));
+          }
+          const command = fixture.marker.startsWith("replace-")
+            ? `sleep 15 && printf '%s\\n' ${fixture.marker} >> /workspace/pits/pi-fixture.txt`
+            : `printf '%s\\n' ${fixture.marker} >> /workspace/pits/pi-fixture.txt`;
+          return fauxAssistantMessage(fauxToolCall(
+            "sandbox_bash",
+            { command },
+            { id: "pits-fixture-" + fixture.marker }
+          ), { stopReason: "toolUse" });
+        }));
+      } else {
+        models.setProvider(this.ai.provider);
+      }
       return Harness.open(storage, { models, registry: this.registry }, context);
     },
-    defaults: { model: this.ai("@cf/moonshotai/kimi-k2.7-code"), thinkingLevel: "low" }
+    defaults: {
+      model: this.env.PITS_ENABLE_FIXTURE === "true"
+        ? this.fixture.getModel()
+        : this.ai("@cf/moonshotai/kimi-k2.7-code"),
+      thinkingLevel: "low"
+    }
   });
 
   // Lifecycle owns the one Durable Object alarm; the process runner must not set one.
@@ -72,19 +146,71 @@ export class PitsAgent extends DurableObject<Env> {
   }
 
   // Manual API is deliberately small: S0 can be run without an LLM.
-  async runProbe(id: string, command: string) {
+  async runProbe(id: string, command: string, faultAt?: FaultStage) {
     if (!/^[a-z0-9-]{1,63}$/.test(id)) throw new Error("Invalid probe ID");
-    return this.runner.execute("probe:" + id, command);
+    if (faultAt && this.env.PITS_ENABLE_FAULTS !== "true") throw new Error("Fault injection is disabled");
+    if (faultAt === "after_backup_before_checkpoint") throw new Error("Fault stage only applies to checkpointing");
+    return this.runner.execute("probe:" + id, command, faultAt);
   }
-  async checkpoint() { return this.runner.checkpoint(); }
+  async checkpoint(faultAt?: FaultStage) {
+    if (faultAt && this.env.PITS_ENABLE_FAULTS !== "true") throw new Error("Fault injection is disabled");
+    if (faultAt && faultAt !== "after_backup_before_checkpoint") throw new Error("Invalid checkpoint fault stage");
+    return this.runner.checkpoint(faultAt);
+  }
   async restore() { return this.runner.restore(); }
   async readEvidence(path: string) { return this.runner.readEvidence(path); }
   async reconcile(checkpointId: string) { return this.runner.acknowledgeReconciliation(checkpointId); }
-  async inspect() { return this.runner.inspect(); }
+  async inspect() {
+    const runner = await this.runner.inspect();
+    const messages = await this.harness.messages();
+    const pending = await this.harness.pending();
+    return {
+      ...runner,
+      pi: {
+        messageCount: messages.length,
+        pendingCount: pending.length,
+        sessions: await this.harness.sessions.list(),
+        lifecycleAlarm: await this.ctx.storage.getAlarm(),
+        fixtureModelCalls: this.fixture.state.callCount
+      }
+    };
+  }
   async destroyForTest() { return this.runner.destroyForTest(); }
   async ask(prompt: string) {
     const result = await this.harness.prompt(prompt);
     return { text: result.text };
+  }
+  async askFixture(marker: string) {
+    if (this.env.PITS_ENABLE_FIXTURE !== "true") throw new Error("Deterministic fixture is disabled");
+    if (!/^[a-z0-9-]{1,63}$/.test(marker)) throw new Error("Invalid fixture marker");
+    const result = await this.harness.prompt("pits-fixture:" + marker, { operationId: "fixture-" + marker });
+    const toolResult = result.messages
+      .flatMap(entry => entry.model ?? [])
+      .filter(message => message.role === "toolResult" && message.toolName === "sandbox_bash")
+      .reverse()
+      .find(message => message.role === "toolResult");
+    let command: { commandId?: string; state?: string; exitCode?: number } | null = null;
+    if (toolResult) {
+      const text = toolResult.content.filter(block => block.type === "text").map(block => block.text).join("\n");
+      try {
+        const parsed = JSON.parse(text) as { commandId?: unknown; state?: unknown; exitCode?: unknown };
+        command = {
+          ...(typeof parsed.commandId === "string" ? { commandId: parsed.commandId } : {}),
+          ...(typeof parsed.state === "string" ? { state: parsed.state } : {}),
+          ...(typeof parsed.exitCode === "number" ? { exitCode: parsed.exitCode } : {})
+        };
+      } catch { /* Pi keeps the tool entry even if its payload was truncated. */ }
+    }
+    return {
+      text: result.text,
+      messageCount: result.messages.length,
+      modelCalls: this.fixture.state.callCount,
+      command
+    };
+  }
+  async abortForTest() {
+    if (this.env.PITS_ENABLE_FAULTS !== "true") throw new Error("Fault injection is disabled");
+    this.runner.abortForTest();
   }
 }
 
@@ -108,13 +234,30 @@ export default {
       }
       if (request.method !== "POST") return new Response("Not found", { status: 404 });
       if (pathname === "/api/probe") {
-        const body = await request.json() as { id?: unknown; command?: unknown };
+        const body = await request.json() as { id?: unknown; command?: unknown; faultAt?: unknown };
         if (typeof body.id !== "string" || typeof body.command !== "string") {
           return new Response("Expected id and command strings", { status: 400 });
         }
-        return Response.json(await agent.runProbe(body.id, body.command));
+        if (body.faultAt !== undefined && typeof body.faultAt !== "string") {
+          return new Response("faultAt must be a test fault stage", { status: 400 });
+        }
+        if (body.faultAt !== undefined && !FAULT_STAGES.includes(body.faultAt as FaultStage)) {
+          return new Response("Unknown test fault stage", { status: 400 });
+        }
+        return Response.json(await agent.runProbe(body.id, body.command, body.faultAt as FaultStage | undefined));
       }
-      if (pathname === "/api/checkpoint") return Response.json(await agent.checkpoint());
+      if (pathname === "/api/checkpoint") {
+        const body = request.headers.get("Content-Type")?.includes("application/json")
+          ? await request.json() as { faultAt?: unknown }
+          : {};
+        if (body.faultAt !== undefined && typeof body.faultAt !== "string") {
+          return new Response("faultAt must be a test fault stage", { status: 400 });
+        }
+        if (body.faultAt !== undefined && !FAULT_STAGES.includes(body.faultAt as FaultStage)) {
+          return new Response("Unknown test fault stage", { status: 400 });
+        }
+        return Response.json(await agent.checkpoint(body.faultAt as FaultStage | undefined));
+      }
       if (pathname === "/api/restore") return Response.json(await agent.restore());
       if (pathname === "/api/reconcile") {
         const body = await request.json() as { checkpointId?: unknown };
@@ -129,9 +272,18 @@ export default {
         }
         return Response.json(await agent.ask(body.prompt));
       }
+      if (pathname === "/api/ask-fixture" && env.PITS_ENABLE_FIXTURE === "true") {
+        const body = await request.json() as { marker?: unknown };
+        if (typeof body.marker !== "string") return new Response("Expected marker string", { status: 400 });
+        return Response.json(await agent.askFixture(body.marker));
+      }
       if (pathname === "/api/destroy" && env.PITS_ENABLE_FAULTS === "true") {
         await agent.destroyForTest();
         return Response.json({ destroyed: true });
+      }
+      if (pathname === "/api/abort" && env.PITS_ENABLE_FAULTS === "true") {
+        await agent.abortForTest();
+        return Response.json({ aborted: true });
       }
       return new Response("Not found", { status: 404 });
     } catch (cause) {

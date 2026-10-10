@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { decide, observationGate, forbidUncertainRedispatch } from "../src/recovery.mjs";
+import { decide, observationGate, forbidUncertainRedispatch, classifyObservationFailure } from "../src/recovery.mjs";
 
 test("first invocation can dispatch", () => {
   assert.equal(decide(undefined, "boot-1", "missing"), "dispatch");
@@ -41,4 +41,10 @@ test("workspace loss and pending reconciliation block even same-command observat
   for (const [restoreRequired, reconciliationRequired] of [[true,false],[false,true]]) {
     assert.equal(observationGate({active:"command-1", requested:"command-1", restoreRequired, reconciliationRequired}), "blocked");
   }
+});
+
+test("process observation failures are lost only after a proven boot change", () => {
+  assert.equal(classifyObservationFailure("boot-1", undefined), "unknown");
+  assert.equal(classifyObservationFailure("boot-1", "boot-1"), "unknown");
+  assert.equal(classifyObservationFailure("boot-1", "boot-2"), "lost");
 });

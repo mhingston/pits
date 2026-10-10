@@ -42,3 +42,14 @@ export function observationGate(state) {
   if (state.active && state.active !== state.requested) return "blocked";
   return "observe";
 }
+
+/**
+ * A failure to query process state is ambiguous on the same boot. A changed
+ * boot proves that a prior dispatch can no longer be observed or replayed.
+ * @param {string} intentBootId
+ * @param {string | undefined} observedBootId
+ * @returns {"unknown"|"lost"}
+ */
+export function classifyObservationFailure(intentBootId, observedBootId) {
+  return observedBootId && observedBootId !== intentBootId ? "lost" : "unknown";
+}

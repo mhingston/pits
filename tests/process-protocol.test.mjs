@@ -4,7 +4,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { RUN, STATUS } from "../src/process-protocol.mjs";
+import { isSafeForegroundCommand, RUN, STATUS } from "../src/process-protocol.mjs";
 
 const status = dir => execFileSync("sh", ["-c", STATUS, "sh", dir], { encoding: "utf8" }).trim();
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -39,4 +39,29 @@ test("reservation without PID remains starting; do not automatically retry", () 
     assert.equal(status(dir), "starting");
     assert.ok(!existsSync(join(dir, "exit-code")));
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("S0 foreground command subset rejects every shell escape and detached writer form", () => {
+  for (const command of [
+    "printf '%s\\n' marker-1 >> /workspace/pits/marker.txt",
+    "sleep 60 && printf '%s\\n' marker-2 >> /workspace/pits/marker.txt",
+    "mkdir -p /workspace/pits/checkpoint",
+    "sha256sum /workspace/pits/marker.txt",
+    "cat /workspace/pits/marker.txt",
+    "test -f /workspace/pits/marker.txt"
+  ]) assert.equal(isSafeForegroundCommand(command), true, command);
+
+  for (const command of [
+    "sleep 60 &",
+    "nohup sleep 60",
+    "sh -c 'sleep 60 &'",
+    "python -c 'import os; os.fork()'",
+    "node -e 'setInterval(() => {}, 1000)'",
+    "printf '%s\\n' marker; sleep 60",
+    "printf '%s\\n' marker | tee /workspace/pits/marker.txt",
+    "printf '%s\\n' marker > /workspace/pits/../outside.txt",
+    "sleep 181",
+    "sleep 180 && sleep 1",
+    "cat /etc/passwd"
+  ]) assert.equal(isSafeForegroundCommand(command), false, command);
 });

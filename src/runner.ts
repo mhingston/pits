@@ -1,6 +1,6 @@
 import { DirectoryBackup, type DirectoryBackupRecord, type DirectoryBackupGatewayBinding } from "@cloudflare/sandbox";
-import { decide, observationGate, forbidUncertainRedispatch } from "./recovery.mjs";
-import { RUN, STATUS } from "./process-protocol.mjs";
+import { decide, observationGate, forbidUncertainRedispatch, classifyObservationFailure } from "./recovery.mjs";
+import { isSafeForegroundCommand, RUN, STATUS } from "./process-protocol.mjs";
 
 const ROOT = "/var/lib/pits-processes";
 const WORKSPACE = "/workspace/pits"; // Created after startup; directory restore works under wrangler dev.
@@ -33,6 +33,15 @@ interface Checkpoint {
   sequence: number;
 }
 
+export type FaultStage =
+  | "before_intent"
+  | "after_intent"
+  | "after_reservation"
+  | "after_launch"
+  | "after_exit_before_receipt"
+  | "after_receipt"
+  | "after_backup_before_checkpoint";
+
 export async function commandIdFromTask(taskId: string): Promise<string> {
   return "p" + (await hash("task:" + taskId)).slice(0, 32);
 }
@@ -60,11 +69,13 @@ export class SandboxRunner {
       (ctx.exports as unknown as { DirectoryBackupGateway: DirectoryBackupGatewayBinding }).DirectoryBackupGateway,
       { binding: "BACKUPS", prefix: "pits-s0/" }
     );
-    // A restarted DO does not inherit inactivity timers. PiHarness owns alarms;
-    // NEVER call setAlarm here.
-    if (this.container.running) {
-      void ctx.blockConcurrencyWhile(() => this.container.setInactivityTimeout(TIMEOUT_MS));
-    }
+    // A DO restart terminates any in-flight DirectoryBackup helper. Therefore
+    // a persisted maintenance marker at construction is stale and must not
+    // wedge checkpoint/restore forever. PiHarness owns alarms; never set one.
+    ctx.blockConcurrencyWhile(async () => {
+      if (await this.storage.get<boolean>("maintenance")) await this.storage.delete("maintenance");
+      if (this.container.running) await this.container.setInactivityTimeout(TIMEOUT_MS);
+    });
   }
 
   private async ensureContainer(): Promise<{ bootId: string }> {
@@ -107,8 +118,15 @@ export class SandboxRunner {
     throw new Error("Unrecognised process state: " + stdout);
   }
 
-  async execute(taskId: string, command: string): Promise<Result> {
+  private injectFault(requested: FaultStage | undefined, stage: FaultStage): void {
+    if (requested === stage) this.ctx.abort("pits fault injection: " + stage, { retryAlarm: false });
+  }
+
+  async execute(taskId: string, command: string, faultAt?: FaultStage): Promise<Result> {
     if (!command.trim() || command.length > 4096) throw new Error("Command must be 1..4096 characters");
+    if (!isSafeForegroundCommand(command)) {
+      throw new Error("Command is outside the S0 foreground command subset");
+    }
     const id = await commandIdFromTask(taskId);
     const digest = await hash(command);
     const receipt = await this.storage.get<Result>("receipt:" + id);
@@ -147,13 +165,9 @@ export class SandboxRunner {
       throw new Error("Workspace unavailable or another command is active; recovery required");
     }
 
-    // Stage 0 does not support detached/background processes. This rejects
-    // common patterns, but is NOT a security sandbox; use only controlled probes.
-    if (/(^|[^&])&(?!&)/.test(command) || /\b(nohup|setsid|disown|screen|tmux|crontab|systemctl)\b/.test(command)) {
-      throw new Error("Detached/background shell processes are forbidden in S0");
-    }
     // Persistent single-writer gate shared with workspace checkpointing.
     // The Pi tool additionally requests executionMode: sequential.
+    this.injectFault(faultAt, "before_intent");
     await this.storage.transaction(async tx => {
       if (await tx.get<boolean>("maintenance")) throw new Error("Workspace maintenance in progress");
       const active = await tx.get<string>("active");
@@ -170,8 +184,15 @@ export class SandboxRunner {
       }
       await tx.put("active", id);
     });
+    if (!intent) throw new Error("Durable command intent was not established");
+    this.injectFault(faultAt, "after_intent");
 
-    const observation = await this.status(id);
+    let observation: Awaited<ReturnType<SandboxRunner["status"]>>;
+    try {
+      observation = await this.status(id);
+    } catch {
+      return this.observationFailure(id, intent, "Process observation failed after intent commit");
+    }
     const action = forbidUncertainRedispatch(
       decide(intent, bootId, observation.kind),
       (await this.storage.get<boolean>("no-redispatch:" + id)) ?? false
@@ -185,17 +206,31 @@ export class SandboxRunner {
       if (reserved.exitCode === 0) {
         // The DO intent was stored BEFORE the container's atomic mkdir.
         // A crash after mkdir but before exec is UNKNOWN, not a retry.
-        await this.container.exec(
-          ["sh", "-c", RUN, "sh", ROOT + "/" + id, "sh", "-lc", command],
-          { cwd: WORKSPACE, stdout: "ignore", stderr: "ignore" }
-        );
+        this.injectFault(faultAt, "after_reservation");
+        try {
+          await this.container.exec(
+            ["sh", "-c", RUN, "sh", ROOT + "/" + id, "sh", "-lc", command],
+            { cwd: WORKSPACE, stdout: "ignore", stderr: "ignore" }
+          );
+        } catch {
+          // The launch acknowledgement can be lost after the container accepted
+          // the process. Keep the reservation and never issue a second launch.
+          return this.observationFailure(id, intent, "Process launch acknowledgement was lost");
+        }
+        this.injectFault(faultAt, "after_launch");
       }
       // If mkdir lost a concurrent race, follow the winner.
     }
     const started = Date.now();
     while (Date.now() - started < MAX_POLL_MS) {
-      const now = await this.status(id);
+      let now: Awaited<ReturnType<SandboxRunner["status"]>>;
+      try {
+        now = await this.status(id);
+      } catch {
+        return this.observationFailure(id, intent, "Process state could not be observed after dispatch");
+      }
       if (now.kind === "exited") {
+        this.injectFault(faultAt, "after_exit_before_receipt");
         const stdout = await this.sh(["sh", "-c", 'tail -c 32768 "$1/stdout.log"', "sh", ROOT + "/" + id]);
         const stderr = await this.sh(["sh", "-c", 'tail -c 32768 "$1/stderr.log"', "sh", ROOT + "/" + id]);
         const result: Result = {
@@ -213,6 +248,7 @@ export class SandboxRunner {
           await tx.put("last-command", id);
           if (await tx.get<string>("active") === id) await tx.delete("active");
         });
+        this.injectFault(faultAt, "after_receipt");
         return result;
       }
       if (now.kind === "lost") return this.ambiguous(id, "unknown", "Launcher ended without exit receipt");
@@ -234,6 +270,22 @@ export class SandboxRunner {
     return { commandId: id, state, reason };
   }
 
+  private async observationFailure(id: string, intent: Intent, reason: string): Promise<Result> {
+    let observedBootId: string | undefined;
+    try {
+      observedBootId = (await this.ensureContainer()).bootId;
+    } catch {
+      // The existing process remains ambiguous if the container cannot be
+      // restarted or inspected. The durable active lock is intentionally kept.
+    }
+    const classification = classifyObservationFailure(intent.bootId, observedBootId);
+    if (classification === "lost") await this.storage.put("restore-required", true);
+    if (classification === "lost") {
+      return this.ambiguous(id, classification, "Container boot changed during process observation");
+    }
+    return this.ambiguous(id, "unknown", reason);
+  }
+
   private async beginMaintenance(): Promise<void> {
     await this.storage.transaction(async tx => {
       if (await tx.get<boolean>("maintenance")) throw new Error("Maintenance already running");
@@ -242,7 +294,7 @@ export class SandboxRunner {
     });
   }
 
-  async checkpoint(): Promise<Checkpoint> {
+  async checkpoint(faultAt?: FaultStage): Promise<Checkpoint> {
     await this.beginMaintenance();
     try {
       const { bootId } = await this.ensureContainer();
@@ -255,6 +307,7 @@ export class SandboxRunner {
       const backup = await this.backups.backup({
         dir: WORKSPACE, exclude: ["node_modules/", ".cache/"]
       });
+      this.injectFault(faultAt, "after_backup_before_checkpoint");
       const point: Checkpoint = {
         backup, bootId,
         commandId: await this.storage.get<string>("last-command") ?? null,
@@ -344,5 +397,10 @@ export class SandboxRunner {
   async destroyForTest(): Promise<void> {
     if (this.container.running) await this.container.destroy();
     await this.storage.put("restore-required", true);
+  }
+
+  abortForTest(): void {
+    // Leave Lifecycle's pending alarm eligible to wake PiHarness after reset.
+    this.ctx.abort("pits fault injection: Durable Object interruption");
   }
 }

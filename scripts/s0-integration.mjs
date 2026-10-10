@@ -1,0 +1,614 @@
+#!/usr/bin/env node
+import assert from "node:assert/strict";
+import { createHash, randomBytes } from "node:crypto";
+import { mkdirSync, appendFileSync, readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { spawn } from "node:child_process";
+import { execFileSync } from "node:child_process";
+
+const baseUrl = process.env.PITS_URL;
+const token = process.env.PITS_API_TOKEN;
+const accessCookie = process.env.PITS_ACCESS_COOKIE;
+const iterations = Number(process.env.PITS_ITERATIONS ?? 10);
+const testId = process.env.PITS_TEST_ID ??
+  `${new Date().toISOString().replace(/[^0-9]/g, "").slice(0, 14)}-${randomBytes(4).toString("hex")}`;
+const artifactPath = resolve(process.env.PITS_EVIDENCE ?? `artifacts/s0-${testId}.jsonl`);
+const logsPath = resolve(process.env.PITS_CLOUDFLARE_LOGS ?? `artifacts/s0-${testId}.cloudflare.jsonl`);
+
+assert.ok(baseUrl, "Set PITS_URL to the disposable Cloudflare Worker URL");
+assert.ok(token && token.length >= 32, "Set PITS_API_TOKEN to the locally held test secret (at least 32 characters)");
+assert.ok(Number.isInteger(iterations) && iterations >= 10 && iterations <= 100, "PITS_ITERATIONS must be 10..100");
+const base = new URL(baseUrl);
+assert.equal(base.protocol, "https:", "Live integration tests require HTTPS");
+assert.ok(!["localhost", "127.0.0.1", "::1"].includes(base.hostname), "Local emulation is not live Cloudflare evidence");
+assert.ok(base.hostname.startsWith("pits-s0-test."), "PITS_URL must target the isolated pits-s0-test hostname");
+
+mkdirSync(dirname(artifactPath), { recursive: true });
+mkdirSync(dirname(logsPath), { recursive: true });
+const sourceCommit = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+const lock = JSON.parse(readFileSync(new URL("../package-lock.json", import.meta.url), "utf8"));
+const versions = Object.fromEntries(["@cloudflare/sandbox", "agents", "@earendil-works/pi-durable", "@earendil-works/pi-ai", "wrangler"]
+  .map(name => [name, lock.packages[`node_modules/${name}`]?.version ?? "unknown"]));
+const common = { testId, sourceCommit, versions, containerImage: "cloudflare/sandbox:1.0.0" };
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const sha256 = value => createHash("sha256").update(value).digest("hex");
+const redact = value => String(value)
+  .replaceAll(token, "[REDACTED]")
+  .replace(accessCookie ?? "\u0000", "[ACCESS-REDACTED]")
+  .replace(/(Bearer\s+)[^\s"']+/gi, "$1[REDACTED]");
+
+function record(scenario, fields = {}) {
+  const row = { ...common, at: new Date().toISOString(), scenario, ...fields };
+  appendFileSync(artifactPath, JSON.stringify(row) + "\n", { mode: 0o600 });
+  console.log(JSON.stringify(row));
+  return row;
+}
+
+async function request(path, body, { auth = true, timeoutMs = 190_000 } = {}) {
+  const headers = {};
+  if (auth) headers.Authorization = `Bearer ${token}`;
+  if (accessCookie) headers.Cookie = `CF_Authorization=${accessCookie}`;
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+  try {
+    const response = await fetch(new URL(path, base), {
+      method: body === undefined ? "GET" : "POST",
+      headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: AbortSignal.timeout(timeoutMs)
+    });
+    const text = await response.text();
+    let parsed;
+    try { parsed = JSON.parse(text); } catch { parsed = { text: redact(text).slice(0, 1000) }; }
+    return { status: response.status, body: parsed };
+  } catch (error) {
+    return { status: 0, body: { error: error instanceof Error ? error.name : "request-failed" } };
+  }
+}
+
+function expectStatus(response, status, scenario) {
+  assert.equal(response.status, status, `${scenario}: HTTP ${response.status}`);
+  return response.body;
+}
+
+async function state() {
+  return expectStatus(await request("/api/state"), 200, "state");
+}
+
+async function evidence(path) {
+  const response = await request(`/api/evidence?path=${encodeURIComponent(path)}`);
+  if (response.status === 409 || response.status === 404) return undefined;
+  return expectStatus(response, 200, `evidence ${path}`).text;
+}
+
+async function markerCount(path, marker) {
+  const text = await evidence(path);
+  return text === undefined ? 0 : text.split(/\r?\n/).filter(line => line === marker).length;
+}
+
+function appendCommand(marker, path) {
+  return `printf '%s\\n' ${marker} >> /workspace/pits/${path}`;
+}
+
+function resultSummary(body) {
+  return {
+    commandId: body?.commandId ?? null,
+    classification: body?.state ?? null,
+    exitCode: body?.exitCode ?? null,
+    reason: body?.reason ?? null
+  };
+}
+
+let logChild;
+let logTail = "";
+let logStatus = "not-started";
+function startCloudflareLogs() {
+  const worker = "pits-s0-test";
+  const env = { ...process.env };
+  delete env.PITS_API_TOKEN;
+  logChild = spawn("npx", ["wrangler", "tail", worker, "--format", "json"], {
+    cwd: process.cwd(), env, stdio: ["ignore", "pipe", "pipe"]
+  });
+  logChild.stdout.setEncoding("utf8");
+  logChild.stderr.setEncoding("utf8");
+  const writeLines = chunk => {
+    logTail += chunk;
+    const lines = logTail.split("\n");
+    logTail = lines.pop() ?? "";
+    for (const line of lines) if (line.trim()) appendFileSync(logsPath, redact(line) + "\n", { mode: 0o600 });
+  };
+  logChild.stdout.on("data", writeLines);
+  logChild.stderr.on("data", chunk => { logStatus = "wrangler-tail-warning"; writeLines(chunk); });
+  logChild.on("spawn", () => { logStatus = "capturing"; });
+  logChild.on("error", () => { logStatus = "failed-to-start"; });
+}
+
+function deployTestWorker(faults, fixture) {
+  return new Promise(resolve => {
+    const env = { ...process.env };
+    delete env.PITS_API_TOKEN;
+    delete env.PITS_ACCESS_COOKIE;
+    const child = spawn("npx", [
+      "wrangler", "deploy", "--config", "wrangler.s0-test.jsonc",
+      "--var", `PITS_ENABLE_FAULTS:${faults}`,
+      "--var", `PITS_ENABLE_FIXTURE:${fixture}`
+    ], { cwd: process.cwd(), env, stdio: ["ignore", "pipe", "pipe"] });
+    let output = "";
+    let timedOut = false;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGINT");
+    }, 8 * 60_000);
+    const collect = chunk => {
+      const safe = redact(chunk.toString());
+      output += safe;
+      appendFileSync(logsPath, safe, { mode: 0o600 });
+    };
+    child.stdout.on("data", collect);
+    child.stderr.on("data", collect);
+    child.on("error", error => {
+      clearTimeout(timeout);
+      resolve({ code: null, timedOut, output: redact(error.message) });
+    });
+    child.on("close", code => {
+      clearTimeout(timeout);
+      resolve({ code, timedOut, output: output.slice(-4000) });
+    });
+  });
+}
+
+async function stopCloudflareLogs() {
+  if (!logChild) return;
+  if (logChild.exitCode === null) logChild.kill("SIGINT");
+  await Promise.race([
+    new Promise(resolve => logChild.once("close", resolve)),
+    sleep(5000)
+  ]);
+  if (logTail.trim()) appendFileSync(logsPath, redact(logTail) + "\n", { mode: 0o600 });
+  if (logStatus === "capturing") logStatus = "captured";
+}
+
+async function invokeFault(id, command, faultAt) {
+  const response = await request("/api/probe", { id, command, faultAt });
+  assert.notEqual(response.status, 200, `${faultAt}: injected DO abort unexpectedly returned a normal response`);
+  return response;
+}
+
+async function invokeCheckpointFault(faultAt) {
+  const response = await request("/api/checkpoint", { faultAt });
+  assert.notEqual(response.status, 200, `${faultAt}: injected DO abort unexpectedly returned a normal response`);
+  return response;
+}
+
+async function restoreAndReconcile(checkpoint, expectedFiles = []) {
+  const destroy = await request("/api/destroy", {});
+  expectStatus(destroy, 200, "destroy test container");
+  const started = Date.now();
+  const restored = expectStatus(await request("/api/restore", {}), 200, "restore checkpoint");
+  assert.equal(restored.backup.id, checkpoint.backup.id, "restore returned the committed checkpoint");
+  const restoredState = await state();
+  assert.equal(restoredState.reconciliationRequired, true, "restore sets reconciliation gate");
+  const afterFiles = {};
+  for (const [path, expectedHash] of expectedFiles) {
+    const text = await evidence(path);
+    assert.notEqual(text, undefined, `restored file ${path} exists`);
+    const digest = sha256(text);
+    assert.equal(digest, expectedHash, `restored file ${path} matches checkpoint hash`);
+    afterFiles[path] = digest;
+  }
+  record("workspace-restore", {
+    pass: true,
+    checkpointId: restored.backup.id,
+    sha256: restored.backup.sha256,
+    size: restored.backup.size,
+    durationMs: Date.now() - started,
+    bootId: restoredState.boot,
+    files: afterFiles
+  });
+  return restored;
+}
+
+let outcome = "passed";
+let cleanupAttempted = false;
+try {
+  const enabled = await deployTestWorker(true, true);
+  assert.equal(enabled.code, 0, `could not enable isolated test switches: ${enabled.output}`);
+  record("test-switches-enabled", { pass: true, worker: "pits-s0-test", deploymentExitCode: enabled.code });
+  startCloudflareLogs();
+  const health = expectStatus(await request("/health", undefined, { auth: false }), 200, "health");
+  assert.equal(health.service, "pits-s0");
+  assert.equal((await request("/api/state", undefined, { auth: false })).status, 401, "API rejects missing bearer token");
+  let current = await state();
+  record("preflight", { pass: true, containerBootId: current.boot ?? null, pi: current.pi ?? null });
+
+  // Drive an actual pi-durable task with a zero-cost deterministic pi-ai provider.
+  const fixtureMarker = `pi-${testId}`;
+  const fixturePending = request("/api/ask-fixture", { marker: fixtureMarker });
+  await sleep(1500);
+  const duringFixture = await state();
+  assert.ok(duringFixture.pi.pendingCount > 0, "PiHarness reports a pending durable operation");
+  assert.ok(duringFixture.pi.lifecycleAlarm !== null, "Lifecycle scheduled the shared DO alarm");
+  const fixtureBoot = duringFixture.boot;
+  const abortedFixture = await request("/api/abort", {});
+  assert.notEqual(abortedFixture.status, 200, "test abort resets the DO instance");
+  await fixturePending;
+  const recoveredFixture = expectStatus(await request("/api/ask-fixture", { marker: fixtureMarker }), 200, "reattach Pi fixture");
+  assert.match(recoveredFixture.text, new RegExp(`fixture complete ${fixtureMarker}`));
+  assert.ok(recoveredFixture.command?.commandId, "Pi tool result retains its command receipt");
+  assert.equal(recoveredFixture.command.state, "exited");
+  const fixtureEffects = await markerCount("pi-fixture.txt", fixtureMarker);
+  assert.equal(fixtureEffects, 1, "PiHarness tool caused exactly one filesystem append");
+  current = await state();
+  assert.equal(current.boot, fixtureBoot, "DO restart preserved the existing container boot");
+  assert.equal(current.pi.pendingCount, 0, "PiHarness recovered and settled the submitted task");
+  record("piharness-lifecycle-recovery", {
+    pass: true, commandId: recoveredFixture.command?.commandId ?? null,
+    classification: recoveredFixture.command?.state ?? "tool result not exposed",
+    effects: fixtureEffects, bootIdBefore: fixtureBoot, bootIdAfter: current.boot,
+    piMessageCount: current.pi.messageCount, lifecycleAlarmAfter: current.pi.lifecycleAlarm
+  });
+
+  const baseFileMarker = `base-${testId}`;
+  expectStatus(await request("/api/probe", {
+    id: `base-${testId}`,
+    command: `printf '%s\\n' ${baseFileMarker} > /workspace/pits/baseline.txt`
+  }), 200, "create baseline");
+  const baselineText = await evidence("baseline.txt");
+  assert.equal(baselineText, baseFileMarker + "\n");
+  const baselineHash = sha256(baselineText);
+  const checkpointStarted = Date.now();
+  const checkpoint = expectStatus(await request("/api/checkpoint", {}), 200, "initial checkpoint");
+  assert.ok(checkpoint.backup.size > 0);
+  assert.match(checkpoint.backup.sha256, /^[a-f0-9]{64}$/);
+  const checkpointDurationMs = Date.now() - checkpointStarted;
+  const checkpointCommittedAt = Date.now();
+  const fixtureWorkspaceText = await evidence("pi-fixture.txt");
+  assert.notEqual(fixtureWorkspaceText, undefined, "checkpoint contains the Pi fixture marker");
+  const fixtureWorkspaceHash = sha256(fixtureWorkspaceText);
+  record("checkpoint-commit", {
+    pass: true, checkpointId: checkpoint.backup.id, sha256: checkpoint.backup.sha256,
+    size: checkpoint.backup.size, baselineHash, durationMs: checkpointDurationMs,
+    bootId: checkpoint.bootId
+  });
+
+  // Replace the container while PiHarness is awaiting a long-running tool.
+  // The durable transcript must retain a lost result and must not claim success.
+  {
+    const marker = `replace-${testId}`;
+    const before = await state();
+    const initialAsk = request("/api/ask-fixture", { marker });
+    await sleep(1500);
+    const active = await state();
+    assert.ok(active.activeIntent, "Pi fixture started its sandbox command");
+    await expectStatus(await request("/api/destroy", {}), 200, "replace container during Pi command");
+    const initialResult = expectStatus(await initialAsk, 200, "settle Pi command after replacement");
+    const recovered = expectStatus(await request("/api/ask-fixture", { marker }), 200, "reattach Pi operation after replacement");
+    assert.equal(recovered.command?.state, "lost");
+    assert.deepEqual(recovered.command, initialResult.command);
+    assert.match(recovered.text, /fixture observed lost/);
+    assert.match(recovered.text, /reconciliation is required/);
+    const effects = await markerCount("pi-fixture.txt", marker);
+    assert.equal(effects, 0, "lost Pi command was not replayed in replacement container");
+    const after = await state();
+    assert.notEqual(after.boot, before.boot);
+    assert.equal(after.restoreRequired, true);
+    await restoreAndReconcile(checkpoint, [
+      ["baseline.txt", baselineHash], ["pi-fixture.txt", fixtureWorkspaceHash]
+    ]);
+    await expectStatus(await request("/api/reconcile", { checkpointId: checkpoint.backup.id }), 200, "reconcile after Pi container replacement");
+    record("piharness-container-replacement", {
+      pass: true, commandId: recovered.command?.commandId ?? null,
+      classification: recovered.command?.state, effects,
+      bootIdBefore: before.boot, bootIdAfter: after.boot,
+      transcriptMessageCount: recovered.messageCount,
+      recoveryDurationMs: Date.now() - checkpointCommittedAt
+    });
+  }
+
+  // Same ID is idempotent, argument reuse is rejected, and simultaneous same-ID calls share one effect.
+  for (let i = 0; i < iterations; i++) {
+    const marker = `dedup-${testId}-${i}`;
+    const id = `dedup-${testId}-${i}`;
+    const command = appendCommand(marker, `dedup-${i}.txt`);
+    const first = expectStatus(await request("/api/probe", { id, command }), 200, "dedup first");
+    const duplicate = expectStatus(await request("/api/probe", { id, command }), 200, "dedup duplicate");
+    assert.deepEqual(resultSummary(duplicate), resultSummary(first));
+    const different = await request("/api/probe", { id, command: appendCommand("different", `dedup-${i}.txt`) });
+    assert.equal(different.status, 409, "same ID with different arguments is rejected");
+    const effects = await markerCount(`dedup-${i}.txt`, marker);
+    assert.equal(effects, 1);
+    record("duplicate-command", {
+      pass: true, iteration: i + 1, commandId: first.commandId,
+      classification: first.state, effects, sameResult: true, differentArgumentsRejected: true
+    });
+  }
+
+  const concurrentMarker = `concurrent-${testId}`;
+  const concurrentId = `concurrent-${testId}`;
+  const concurrentCommand = `sleep 2 && ${appendCommand(concurrentMarker, "concurrent.txt")}`;
+  const concurrentStarted = Date.now();
+  const concurrent = await Promise.all([
+    request("/api/probe", { id: concurrentId, command: concurrentCommand }),
+    request("/api/probe", { id: concurrentId, command: concurrentCommand })
+  ]);
+  concurrent.forEach((response, i) => expectStatus(response, 200, `concurrent submission ${i + 1}`));
+  const concurrentEffects = await markerCount("concurrent.txt", concurrentMarker);
+  assert.equal(concurrentEffects, 1);
+  record("concurrent-deduplication", {
+    pass: true, commandId: concurrent[0].body.commandId, classification: concurrent[0].body.state,
+    effects: concurrentEffects, recoveryDurationMs: Date.now() - concurrentStarted
+  });
+
+  // Ten deterministic crashes after the SQLite intent commit but before container reservation.
+  for (let i = 0; i < iterations; i++) {
+    const marker = `intent-${testId}-${i}`;
+    const id = `intent-${testId}-${i}`;
+    const command = appendCommand(marker, `intent-${i}.txt`);
+    const bootBefore = (await state()).boot;
+    await invokeFault(id, command, "after_intent");
+    const retry = expectStatus(await request("/api/probe", { id, command }), 200, "recover after intent commit");
+    const effects = await markerCount(`intent-${i}.txt`, marker);
+    assert.equal(retry.state, "exited");
+    assert.equal(effects, 1);
+    const after = await state();
+    record("fault-after-intent", {
+      pass: true, iteration: i + 1, commandId: retry.commandId,
+      classification: retry.state, effects, bootIdBefore: bootBefore, bootIdAfter: after.boot
+    });
+  }
+
+  // Before-intent interruption is retryable because no durable intent or dispatch exists.
+  {
+    const marker = `before-intent-${testId}`, id = `before-intent-${testId}`;
+    const command = appendCommand(marker, "before-intent.txt");
+    await invokeFault(id, command, "before_intent");
+    const retry = expectStatus(await request("/api/probe", { id, command }), 200, "recover before intent");
+    const effects = await markerCount("before-intent.txt", marker);
+    assert.equal(effects, 1);
+    record("fault-before-intent", { pass: true, commandId: retry.commandId, classification: retry.state, effects });
+  }
+
+  // A reservation with no published PID is ambiguous; it must not launch again.
+  // Repeat this crash window 10 times, destroying the ambiguous container before
+  // restoring so restore never overwrites a possibly live process on the same boot.
+  for (let i = 0; i < iterations; i++) {
+    const id = `reservation-${testId}-${i}`, marker = `reservation-${testId}-${i}`;
+    const command = appendCommand(marker, `reservation-${i}.txt`);
+    const bootBefore = (await state()).boot;
+    const faultStarted = Date.now();
+    await invokeFault(id, command, "after_reservation");
+    const uncertain = expectStatus(await request("/api/probe", { id, command }), 200, "observe incomplete reservation");
+    assert.equal(uncertain.state, "unknown");
+    assert.equal(await markerCount(`reservation-${i}.txt`, marker), 0);
+    const blocked = await request("/api/probe", {
+      id: `blocked-${testId}-${i}`, command: appendCommand(`blocked-${i}`, `blocked-${i}.txt`)
+    });
+    assert.equal(blocked.status, 409, "uncertain command blocks another mutation");
+    await expectStatus(await request("/api/destroy", {}), 200, "destroy ambiguous reservation container");
+    const lost = expectStatus(await request("/api/probe", { id, command }), 200, "classify replaced reservation");
+    assert.equal(lost.state, "lost");
+    assert.equal(await markerCount(`reservation-${i}.txt`, marker), 0);
+    const restored = await restoreAndReconcile(checkpoint, [
+      ["baseline.txt", baselineHash], ["pi-fixture.txt", fixtureWorkspaceHash]
+    ]);
+    current = await state();
+    await expectStatus(await request("/api/reconcile", { checkpointId: checkpoint.backup.id }), 200, "reconcile after reservation restore");
+    record("fault-after-reservation", {
+      pass: true, iteration: i + 1, commandId: uncertain.commandId,
+      classification: uncertain.state, afterReplacementClassification: lost.state,
+      effects: 0, bootIdBefore: bootBefore, bootIdAfter: current.boot,
+      restoreCheckpointId: restored.backup.id, otherMutationBlocked: true,
+      recoveryDurationMs: Date.now() - faultStarted
+    });
+  }
+
+  // A DO abort during a 60-second command must preserve the container and reattach the original process.
+  {
+    const id = `do-restart-${testId}`, marker = `do-restart-${testId}`;
+    const command = `sleep 60 && ${appendCommand(marker, "do-restart.txt")}`;
+    const before = await state();
+    const initialRequest = request("/api/probe", { id, command });
+    await sleep(1200);
+    const running = await state();
+    assert.equal(running.activeIntent?.id, `p${sha256(`task:probe:${id}`).slice(0, 32)}`);
+    assert.equal(running.boot, before.boot);
+    const checkpointDuringRun = await request("/api/checkpoint", {});
+    assert.equal(checkpointDuringRun.status, 409, "checkpoint is blocked while command is active");
+    const competing = await request("/api/probe", {
+      id: `competing-${testId}`, command: appendCommand(`competing-${testId}`, "competing.txt")
+    });
+    assert.equal(competing.status, 409, "another mutation is blocked while command is active");
+    const interrupted = await request("/api/abort", {});
+    assert.notEqual(interrupted.status, 200, "DO abort interrupted the active request");
+    await initialRequest;
+    const started = Date.now();
+    const reattached = expectStatus(await request("/api/probe", { id, command }), 200, "reattach after DO restart");
+    const after = await state();
+    const effects = await markerCount("do-restart.txt", marker);
+    assert.equal(reattached.state, "exited");
+    assert.equal(effects, 1);
+    assert.equal(after.boot, before.boot, "container boot remains the same after DO reset");
+    record("do-restart-running-command", {
+      pass: true, commandId: reattached.commandId, classification: reattached.state,
+      effects, bootIdBefore: before.boot, bootIdAfter: after.boot,
+      recoveryDurationMs: Date.now() - started
+    });
+  }
+
+  // Repeat the post-launch and process-exit crash windows, using fresh command
+  // IDs so each interruption exercises its own reservation and receipt.
+  for (const faultAt of ["after_launch", "after_exit_before_receipt", "after_receipt"]) {
+    for (let i = 0; i < iterations; i++) {
+      const id = `${faultAt}-${testId}-${i}`, marker = `${faultAt}-${testId}-${i}`;
+      const path = `${faultAt}-${i}.txt`;
+      const command = faultAt === "after_launch"
+        ? `sleep 3 && ${appendCommand(marker, path)}`
+        : appendCommand(marker, path);
+      const bootBefore = (await state()).boot;
+      const faultStarted = Date.now();
+      await invokeFault(id, command, faultAt);
+      const reattached = expectStatus(await request("/api/probe", { id, command }), 200, `reattach ${faultAt}`);
+      const after = await state();
+      const effects = await markerCount(path, marker);
+      assert.equal(reattached.state, "exited");
+      assert.equal(effects, 1);
+      assert.equal(after.boot, bootBefore);
+      record(`fault-${faultAt}`, {
+        pass: true, iteration: i + 1, commandId: reattached.commandId,
+        classification: reattached.state, effects,
+        bootIdBefore: bootBefore, bootIdAfter: after.boot,
+        recoveryDurationMs: Date.now() - faultStarted
+      });
+    }
+  }
+
+  // Publish the same isolated configuration while a bounded mutation is active.
+  // A deploy may or may not interrupt an in-flight DO; observe boot and classify
+  // the command rather than presuming that it created the desired failure window.
+  {
+    const id = `redeploy-${testId}`, marker = `redeploy-${testId}`;
+    const command = `sleep 65 && ${appendCommand(marker, "redeploy.txt")}`;
+    const before = await state();
+    const initialRequest = request("/api/probe", { id, command });
+    await sleep(1200);
+    const active = await state();
+    assert.equal(active.activeIntent?.id, `p${sha256(`task:probe:${id}`).slice(0, 32)}`);
+    const deployStartedAt = Date.now();
+    const deployment = await deployTestWorker(true, true);
+    assert.equal(deployment.code, 0, `test Worker redeployment failed: ${deployment.output}`);
+    record("redeploy-during-active-command", {
+      pass: true, worker: "pits-s0-test", deployDurationMs: Date.now() - deployStartedAt,
+      deploymentExitCode: deployment.code, commandId: active.activeIntent.id,
+      classificationAtDeployStart: "running", bootIdBefore: before.boot,
+      bootIdAtDeployStart: active.boot
+    });
+    await initialRequest;
+    const reattached = expectStatus(await request("/api/probe", { id, command }), 200, "observe command after redeploy");
+    const after = await state();
+    const effects = await markerCount("redeploy.txt", marker);
+    assert.ok(["exited", "lost"].includes(reattached.state), "redeployed command is collected or conservatively classified");
+    assert.ok(effects <= 1, "redeploy did not duplicate the filesystem effect");
+    if (reattached.state === "exited") assert.equal(effects, 1);
+    if (reattached.state === "lost") {
+      assert.equal(after.restoreRequired, true);
+      await restoreAndReconcile(checkpoint, [
+        ["baseline.txt", baselineHash], ["pi-fixture.txt", fixtureWorkspaceHash]
+      ]);
+      await expectStatus(await request("/api/reconcile", { checkpointId: checkpoint.backup.id }), 200, "reconcile after redeploy loss");
+    }
+    record("redeploy-command-recovery", {
+      pass: true, commandId: reattached.commandId, classification: reattached.state,
+      effects, bootIdBefore: before.boot, bootIdAfter: after.boot,
+      recoveryDurationMs: Date.now() - deployStartedAt
+    });
+  }
+
+  // Replacement during a command changes the boot and classifies the old command lost without replay.
+  {
+    const id = `replace-${testId}`, marker = `replace-${testId}`;
+    const command = `sleep 15 && ${appendCommand(marker, "replace.txt")}`;
+    const before = await state();
+    const initialRequest = request("/api/probe", { id, command });
+    await sleep(1200);
+    await expectStatus(await request("/api/destroy", {}), 200, "replace active command container");
+    await initialRequest;
+    const lost = expectStatus(await request("/api/probe", { id, command }), 200, "classify replaced command");
+    assert.equal(lost.state, "lost");
+    assert.equal(await markerCount("replace.txt", marker), 0);
+    const after = await state();
+    assert.notEqual(after.boot, before.boot);
+    assert.equal(after.restoreRequired, true);
+    record("container-replacement-active", {
+      pass: true, commandId: lost.commandId, classification: lost.state, effects: 0,
+      bootIdBefore: before.boot, bootIdAfter: after.boot
+    });
+    await restoreAndReconcile(checkpoint, [["baseline.txt", baselineHash]]);
+    await expectStatus(await request("/api/reconcile", { checkpointId: checkpoint.backup.id }), 200, "reconcile after manual replacement");
+  }
+
+  // Polling deadline remains observable; completion after 120 seconds releases the lock.
+  {
+    const id = `late-${testId}`, marker = `late-${testId}`;
+    const command = `sleep 125 && ${appendCommand(marker, "late.txt")}`;
+    const started = Date.now();
+    const timedOut = expectStatus(await request("/api/probe", { id, command }, { timeoutMs: 160_000 }), 200, "120-second polling deadline");
+    assert.equal(timedOut.state, "unknown");
+    const blocked = await request("/api/probe", { id: `late-blocked-${testId}`, command: appendCommand("late-blocked", "late-blocked.txt") });
+    assert.equal(blocked.status, 409);
+    await sleep(7000);
+    const lateResult = expectStatus(await request("/api/probe", { id, command }), 200, "collect late result");
+    assert.equal(lateResult.state, "exited");
+    const effects = await markerCount("late.txt", marker);
+    assert.equal(effects, 1);
+    record("late-completion-after-deadline", {
+      pass: true, commandId: lateResult.commandId, classification: lateResult.state,
+      initialClassification: timedOut.state, effects, recoveryDurationMs: Date.now() - started
+    });
+  }
+
+  // A completed post-checkpoint receipt is invalidated after restoring the prior file tree.
+  const postMarker = `post-checkpoint-${testId}`, postId = `post-checkpoint-${testId}`;
+  const postCommand = appendCommand(postMarker, "post-checkpoint.txt");
+  const postResult = expectStatus(await request("/api/probe", { id: postId, command: postCommand }), 200, "post-checkpoint write");
+  assert.equal(await markerCount("post-checkpoint.txt", postMarker), 1);
+
+  // Interrupt after R2 receives the archive but before checkpoint metadata commits.
+  expectStatus(await request("/api/probe", {
+    id: `orphan-${testId}`, command: appendCommand(`orphan-${testId}`, "orphan.txt")
+  }), 200, "create divergent file before interrupted backup");
+  await invokeCheckpointFault("after_backup_before_checkpoint");
+  current = await state();
+  assert.equal(current.checkpoint.backup.id, checkpoint.backup.id, "previous checkpoint metadata remains committed");
+  record("fault-backup-before-metadata", {
+    pass: true, checkpointId: current.checkpoint.backup.id,
+    sha256: current.checkpoint.backup.sha256, size: current.checkpoint.backup.size,
+    orphanBackupPossible: true
+  });
+
+  await restoreAndReconcile(checkpoint, [
+    ["baseline.txt", baselineHash], ["pi-fixture.txt", fixtureWorkspaceHash]
+  ]);
+  assert.equal(await evidence("post-checkpoint.txt"), undefined, "post-checkpoint file is absent after restore");
+  assert.equal(await evidence("orphan.txt"), undefined, "interrupted-backup divergence is absent after restore");
+  const invalidated = expectStatus(await request("/api/probe", { id: postId, command: postCommand }), 200, "observe invalidated receipt");
+  assert.equal(invalidated.state, "lost");
+  const gate = await request("/api/probe", { id: `gate-${testId}`, command: appendCommand("gate", "gate.txt") });
+  assert.equal(gate.status, 409, "restored workspace blocks writes before reconciliation");
+  await expectStatus(await request("/api/reconcile", { checkpointId: checkpoint.backup.id }), 200, "reconcile restored workspace");
+  const resumed = expectStatus(await request("/api/probe", {
+    id: `reconciled-${testId}`, command: appendCommand(`reconciled-${testId}`, "reconciled.txt")
+  }), 200, "mutation after reconciliation");
+  assert.equal(resumed.state, "exited");
+  assert.equal(await markerCount("reconciled.txt", `reconciled-${testId}`), 1);
+  record("restore-divergence-and-reconcile", {
+    pass: true, checkpointId: checkpoint.backup.id, checkpointHash: checkpoint.backup.sha256,
+    fileHash: baselineHash, postCheckpointReceipt: resultSummary(invalidated),
+    postCheckpointEffectsPresent: false, reconciliationGateBlocked: true,
+    lostWorkWindowMs: Date.now() - checkpointCommittedAt,
+    knownLostFiles: 2,
+    knownLostBytes: Buffer.byteLength(postMarker + "\n") + Buffer.byteLength(`orphan-${testId}\n`),
+    postReconciliationCommandId: resumed.commandId, postReconciliationEffects: 1
+  });
+} catch (error) {
+  outcome = "failed";
+  record("suite-failure", { pass: false, error: error instanceof Error ? redact(error.message) : "unknown error" });
+  process.exitCode = 1;
+} finally {
+  if (process.env.PITS_URL && token) {
+    cleanupAttempted = true;
+    const disabled = await deployTestWorker(false, false);
+    const pass = disabled.code === 0;
+    record("fault-injection-disabled", {
+      pass, deploymentExitCode: disabled.code, timedOut: disabled.timedOut,
+      output: disabled.output
+    });
+    if (!pass) {
+      outcome = "failed-cleanup";
+      process.exitCode = 1;
+    }
+  }
+  await stopCloudflareLogs();
+  record("suite-summary", {
+    pass: outcome === "passed", outcome, artifactPath, cloudflareLogsPath: logsPath,
+    cloudflareLogStatus: logStatus, cleanupAttempted
+  });
+}
