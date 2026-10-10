@@ -18,11 +18,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      # Transitional: the repository currently has no committed lockfile.
-      # Generate one, then use npm ci. The generated file is saved as an artifact
-      # so a future PR can commit the exact resolved versions.
-      - name: Resolve pinned dependencies
-        run: npm install --package-lock-only --ignore-scripts --no-audit --no-fund
       - name: Install
         run: npm ci --ignore-scripts --no-audit --no-fund
       - name: Generate Cloudflare types
@@ -31,10 +26,3 @@ jobs:
         run: npm test
       - name: TypeScript
         run: npm run typecheck
-      - name: Preserve dependency lockfile
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: pits-s0-lockfile
-          path: package-lock.json
-          if-no-files-found: ignore
