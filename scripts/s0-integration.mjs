@@ -9,7 +9,7 @@ import { execFileSync } from "node:child_process";
 const baseUrl = process.env.PITS_URL;
 const token = process.env.PITS_API_TOKEN;
 const accessCookie = process.env.PITS_ACCESS_COOKIE;
-const workerName = process.env.PITS_WORKER_NAME ?? "pits-s0-test";
+const workerName = process.env.PITS_WORKER_NAME ?? "pits-s0-test-recovery";
 const iterations = Number(process.env.PITS_ITERATIONS ?? 10);
 const testId = process.env.PITS_TEST_ID ??
   `${new Date().toISOString().replace(/[^0-9]/g, "").slice(0, 14)}-${randomBytes(4).toString("hex")}`;
@@ -22,6 +22,9 @@ assert.ok(Number.isInteger(iterations) && iterations >= 10 && iterations <= 100,
 const base = new URL(baseUrl);
 assert.equal(base.protocol, "https:", "Live integration tests require HTTPS");
 assert.ok(!["localhost", "127.0.0.1", "::1"].includes(base.hostname), "Local emulation is not live Cloudflare evidence");
+const testConfig = JSON.parse(readFileSync(new URL("../wrangler.s0-test.jsonc", import.meta.url), "utf8"));
+assert.equal(workerName, testConfig.name,
+  "PITS_WORKER_NAME must match wrangler.s0-test.jsonc name so the Container application identity is stable");
 assert.ok(base.hostname.startsWith(`${workerName}.`), `PITS_URL must target the isolated ${workerName} hostname`);
 
 mkdirSync(dirname(artifactPath), { recursive: true });

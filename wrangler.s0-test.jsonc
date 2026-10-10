@@ -1,6 +1,6 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
-  "name": "pits-s0-test",
+  "name": "pits-s0-test-recovery",
   "main": "src/index.ts",
   "compatibility_date": "2026-10-09",
   "compatibility_flags": ["nodejs_compat"],
