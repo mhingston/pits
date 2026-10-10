@@ -10,6 +10,7 @@ const baseUrl = process.env.PITS_URL;
 const token = process.env.PITS_API_TOKEN;
 const accessCookie = process.env.PITS_ACCESS_COOKIE;
 const workerName = process.env.PITS_WORKER_NAME ?? "pits-s0-test-recovery";
+const predeployed = process.env.PITS_TEST_PREDEPLOYED === "true";
 const iterations = Number(process.env.PITS_ITERATIONS ?? 10);
 const testId = process.env.PITS_TEST_ID ??
   `${new Date().toISOString().replace(/[^0-9]/g, "").slice(0, 14)}-${randomBytes(4).toString("hex")}`;
@@ -261,14 +262,20 @@ async function restoreAndReconcile(checkpoint, expectedFiles = []) {
 let outcome = "passed";
 let cleanupAttempted = false;
 try {
-  const enabled = await deployTestWorker(true, true);
-  assert.equal(enabled.code, 0, `could not enable isolated test switches: ${enabled.output}`);
-  record("test-switches-enabled", { pass: true, worker: workerName, deploymentExitCode: enabled.code });
+  const enabled = predeployed ? { code: 0 } : await deployTestWorker(true, true);
+  assert.equal(enabled.code, 0,
+    `could not enable isolated test switches: ${"output" in enabled ? enabled.output : "predeployment was not verified"}`);
+  record("test-switches-enabled", {
+    pass: true, worker: workerName, deploymentExitCode: enabled.code,
+    mode: predeployed ? "predeployed-and-verified-below" : "deployed-by-harness"
+  });
   startCloudflareLogs();
   const routingStartedAt = Date.now();
   let routing;
+  let lastRoutingResponse;
   while (Date.now() - routingStartedAt < 120_000) {
     const response = await request("/api/test/status");
+    lastRoutingResponse = { status: response.status, body: response.body };
     if (response.status === 200 && response.body.faultsEnabled === true &&
       response.body.fixtureEnabled === true && response.body.workerFaultsEnabled === true &&
       response.body.workerFixtureEnabled === true && response.body.objectName === `test-${testId}` &&
@@ -278,7 +285,8 @@ try {
     }
     await sleep(1_000);
   }
-  assert.ok(routing, "test Worker deployment did not become active with the requested Durable Object routing");
+  assert.ok(routing,
+    `test Worker deployment did not become active with the requested Durable Object routing; last=${JSON.stringify(lastRoutingResponse)}`);
   record("test-routing-ready", {
     pass: true, objectName: routing.objectName, propagationWaitMs: Date.now() - routingStartedAt
   });
