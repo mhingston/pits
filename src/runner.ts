@@ -186,9 +186,15 @@ export class SandboxRunner {
       return receipt;
     }
 
-    const { bootId } = await this.ensureContainer();
     let intent = await this.storage.get<Intent>("intent:" + id);
     if (intent && intent.digest !== digest) throw new Error("Command ID reused for different arguments");
+    let bootId: string;
+    try {
+      ({ bootId } = await this.ensureContainer());
+    } catch (error) {
+      if (intent) return this.observationFailure(id, intent, "Container identity could not be observed for an existing intent");
+      throw error; // No intent means no command has been authorised to dispatch.
+    }
 
     // Old intent on a replacement container is never redispatched.
     if (intent && intent.bootId !== bootId) {
