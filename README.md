@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/pits-logo.png" alt="Pi In The Sky (PITS) logo" width="240" />
+</p>
+
 # Pi In The Sky (PITS)
 
 Experimental, remote-first durable coding agents built with Pi Durable and Cloudflare.
