@@ -48,8 +48,9 @@ interface Env {
 
 const FAULT_STAGES: readonly FaultStage[] = [
   "before_intent", "after_intent", "after_reservation", "after_launch",
-  "after_exit_before_receipt", "after_receipt", "after_backup_before_checkpoint"
+  "after_exit_before_receipt", "after_receipt", "during_backup", "after_backup_before_checkpoint"
 ];
+const CHECKPOINT_FAULT_STAGES: readonly FaultStage[] = ["during_backup", "after_backup_before_checkpoint"];
 
 export class PitsAgent extends DurableObject<Env> {
   private readonly runner: SandboxRunner;
@@ -149,15 +150,37 @@ export class PitsAgent extends DurableObject<Env> {
   async runProbe(id: string, command: string, faultAt?: FaultStage) {
     if (!/^[a-z0-9-]{1,63}$/.test(id)) throw new Error("Invalid probe ID");
     if (faultAt && this.env.PITS_ENABLE_FAULTS !== "true") throw new Error("Fault injection is disabled");
-    if (faultAt === "after_backup_before_checkpoint") throw new Error("Fault stage only applies to checkpointing");
+    if (faultAt && CHECKPOINT_FAULT_STAGES.includes(faultAt)) throw new Error("Fault stage only applies to checkpointing");
     return this.runner.execute("probe:" + id, command, faultAt);
   }
   async checkpoint(faultAt?: FaultStage) {
     if (faultAt && this.env.PITS_ENABLE_FAULTS !== "true") throw new Error("Fault injection is disabled");
-    if (faultAt && faultAt !== "after_backup_before_checkpoint") throw new Error("Invalid checkpoint fault stage");
-    return this.runner.checkpoint(faultAt);
+    if (faultAt && !CHECKPOINT_FAULT_STAGES.includes(faultAt)) throw new Error("Invalid checkpoint fault stage");
+    const session = this.harness.session();
+    if (await session.busy()) throw new Error("Pi session must be idle before checkpointing");
+    const messages = await session.messages();
+    return this.runner.checkpoint(faultAt, {
+      sessionId: session.id,
+      entryId: messages.at(-1) ? String(messages.at(-1)!.id) : null,
+      messageCount: messages.length
+    });
   }
-  async restore() { return this.runner.restore(); }
+  async restore() {
+    const session = this.harness.session();
+    if (await session.busy()) throw new Error("Pi session must be idle before restoring a workspace");
+    const checkpoint = await this.runner.restore();
+    const anchor = checkpoint.transcriptAnchor;
+    const handoff = [
+      `Workspace restored to committed checkpoint ${checkpoint.backup.id}.`,
+      anchor
+        ? `The checkpoint captured Pi session ${anchor.sessionId} after transcript entry ${anchor.entryId ?? "(empty transcript)"} (${anchor.messageCount} active entries).`
+        : "The checkpoint predates transcript anchoring.",
+      "This Pi context starts at the restore boundary; prior tool results after the checkpoint are not authoritative for the current filesystem.",
+      "Re-inspect and re-verify relevant files. Workspace mutations remain blocked until the operator explicitly reconciles the restored checkpoint."
+    ].join(" ");
+    await session.reset(handoff);
+    return checkpoint;
+  }
   async readEvidence(path: string) { return this.runner.readEvidence(path); }
   async reconcile(checkpointId: string) { return this.runner.acknowledgeReconciliation(checkpointId); }
   async inspect() {
@@ -168,6 +191,7 @@ export class PitsAgent extends DurableObject<Env> {
       ...runner,
       pi: {
         messageCount: messages.length,
+        activeEntryKinds: messages.map(message => message.kind),
         pendingCount: pending.length,
         sessions: await this.harness.sessions.list(),
         lifecycleAlarm: await this.ctx.storage.getAlarm(),

@@ -1,5 +1,12 @@
 import { DirectoryBackup, type DirectoryBackupRecord, type DirectoryBackupGatewayBinding } from "@cloudflare/sandbox";
-import { decide, observationGate, forbidUncertainRedispatch, classifyObservationFailure } from "./recovery.mjs";
+import {
+  addLostSequenceRange,
+  decide,
+  observationGate,
+  forbidUncertainRedispatch,
+  classifyObservationFailure,
+  receiptWasInvalidated
+} from "./recovery.mjs";
 import { isSafeForegroundCommand, RUN, STATUS } from "./process-protocol.mjs";
 
 const ROOT = "/var/lib/pits-processes";
@@ -31,6 +38,11 @@ interface Checkpoint {
   commandId: string | null;
   createdAt: number;
   sequence: number;
+  transcriptAnchor?: {
+    sessionId: string;
+    entryId: string | null;
+    messageCount: number;
+  };
 }
 
 export type FaultStage =
@@ -40,6 +52,7 @@ export type FaultStage =
   | "after_launch"
   | "after_exit_before_receipt"
   | "after_receipt"
+  | "during_backup"
   | "after_backup_before_checkpoint";
 
 export async function commandIdFromTask(taskId: string): Promise<string> {
@@ -133,6 +146,11 @@ export class SandboxRunner {
     if (receipt) {
       const original = await this.storage.get<Intent>("intent:" + id);
       if (!original || original.digest !== digest) throw new Error("Command ID reused for different arguments");
+      const lostRanges = await this.storage.get<{ afterSequence: number; throughSequence: number }[]>("lost-sequence-ranges") ?? [];
+      if (receiptWasInvalidated(receipt.sequence, lostRanges)) {
+        return { state: "lost", commandId: id, reason: "Receipt postdates a restored workspace; never auto-replay" };
+      }
+      // Read the legacy single-range markers written by earlier S0 builds.
       const restoredFloor = await this.storage.get<number>("restore-floor-sequence");
       const restoredCeiling = await this.storage.get<number>("restore-ceiling-sequence");
       if (restoredFloor !== undefined && restoredCeiling !== undefined &&
@@ -294,7 +312,10 @@ export class SandboxRunner {
     });
   }
 
-  async checkpoint(faultAt?: FaultStage): Promise<Checkpoint> {
+  async checkpoint(
+    faultAt?: FaultStage,
+    transcriptAnchor?: Checkpoint["transcriptAnchor"]
+  ): Promise<Checkpoint> {
     await this.beginMaintenance();
     try {
       const { bootId } = await this.ensureContainer();
@@ -304,15 +325,47 @@ export class SandboxRunner {
       }
       // S0 forbids detached children and external workspace writers. The
       // active-command gate alone cannot establish their absence.
-      const backup = await this.backups.backup({
+      if (faultAt === "during_backup") {
+        await this.storage.delete("test-backup-interruption-fired-at");
+        const fixture = await this.sh([
+          "dd", "if=/dev/urandom", `of=${WORKSPACE}/.pits-backup-interruption.bin`,
+          "bs=1M", "count=64"
+        ]);
+        if (fixture.exitCode !== 0) throw new Error("Cannot prepare backup interruption fixture: " + fixture.stderr);
+      }
+      const options = {
         dir: WORKSPACE, exclude: ["node_modules/", ".cache/"]
+      };
+      let backupCompleted = false;
+      const backupPromise = this.backups.backup(options).then(record => {
+        backupCompleted = true;
+        return record;
       });
+      if (faultAt === "during_backup") {
+        const timer = setTimeout(async () => {
+          if (backupCompleted) return;
+          await this.storage.put("test-backup-interruption-fired-at", Date.now());
+          this.ctx.abort("pits fault injection: during_backup", { retryAlarm: false });
+        }, 250);
+        try {
+          await backupPromise;
+        } finally {
+          clearTimeout(timer);
+        }
+        if (!(await this.storage.get<number>("test-backup-interruption-fired-at"))) {
+          throw new Error("Backup completed before the controlled interruption; increase the fixture size");
+        }
+        // ctx.abort() should have terminated this invocation before this point.
+        throw new Error("DO interruption did not terminate the active backup");
+      }
+      const backup = await backupPromise;
       this.injectFault(faultAt, "after_backup_before_checkpoint");
       const point: Checkpoint = {
         backup, bootId,
         commandId: await this.storage.get<string>("last-command") ?? null,
         createdAt: Date.now(),
-        sequence: await this.storage.get<number>("command-sequence") ?? 0
+        sequence: await this.storage.get<number>("command-sequence") ?? 0,
+        ...(transcriptAnchor ? { transcriptAnchor } : {})
       };
       await this.storage.put("checkpoint", point);
       return point;
@@ -343,8 +396,11 @@ export class SandboxRunner {
       await this.storage.transaction(async tx => {
         await tx.delete("active");
         await tx.put("restore-required", false);
+        const ceiling = await tx.get<number>("command-sequence") ?? 0;
+        const lostRanges = await tx.get<{ afterSequence: number; throughSequence: number }[]>("lost-sequence-ranges") ?? [];
+        await tx.put("lost-sequence-ranges", addLostSequenceRange(lostRanges, point.sequence, ceiling));
         await tx.put("restore-floor-sequence", point.sequence);
-        await tx.put("restore-ceiling-sequence", await tx.get<number>("command-sequence") ?? 0);
+        await tx.put("restore-ceiling-sequence", ceiling);
         await tx.put("reconciliation-required", true);
         await tx.put("restored-checkpoint", point);
       });
@@ -386,6 +442,8 @@ export class SandboxRunner {
       containerRunning: this.container.running,
       active,
       activeIntent: active ? await this.storage.get<Intent>("intent:" + active) : null,
+      processObservation: active ? await this.status(active) : null,
+      backupInterruptionFiredAt: await this.storage.get<number>("test-backup-interruption-fired-at") ?? null,
       restoreRequired: (await this.storage.get<boolean>("restore-required")) ?? false,
       reconciliationRequired: (await this.storage.get<boolean>("reconciliation-required")) ?? false,
       commandSequence: await this.storage.get<number>("command-sequence") ?? 0,

@@ -53,3 +53,35 @@ export function observationGate(state) {
 export function classifyObservationFailure(intentBootId, observedBootId) {
   return observedBootId && observedBootId !== intentBootId ? "lost" : "unknown";
 }
+
+/**
+ * A restore permanently invalidates command receipts whose effects were made
+ * after the restored checkpoint. Preserve prior ranges across later restores
+ * so a lost receipt cannot become successful again after another checkpoint.
+ * @param {readonly { afterSequence: number, throughSequence: number }[]} ranges
+ * @param {number} afterSequence
+ * @param {number} throughSequence
+ * @returns {{ afterSequence: number, throughSequence: number }[]}
+ */
+export function addLostSequenceRange(ranges, afterSequence, throughSequence) {
+  if (throughSequence <= afterSequence) return [...ranges];
+  const sorted = [...ranges, { afterSequence, throughSequence }]
+    .sort((left, right) => left.afterSequence - right.afterSequence);
+  const merged = [];
+  for (const range of sorted) {
+    const previous = merged.at(-1);
+    if (previous && range.afterSequence <= previous.throughSequence) {
+      previous.throughSequence = Math.max(previous.throughSequence, range.throughSequence);
+    } else {
+      merged.push({ ...range });
+    }
+  }
+  return merged;
+}
+
+/** @param {number | undefined} sequence @param {readonly { afterSequence: number, throughSequence: number }[]} ranges */
+export function receiptWasInvalidated(sequence, ranges) {
+  return sequence !== undefined && ranges.some(range =>
+    sequence > range.afterSequence && sequence <= range.throughSequence
+  );
+}

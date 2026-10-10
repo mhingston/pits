@@ -1,6 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { decide, observationGate, forbidUncertainRedispatch, classifyObservationFailure } from "../src/recovery.mjs";
+import {
+  addLostSequenceRange,
+  decide,
+  observationGate,
+  forbidUncertainRedispatch,
+  classifyObservationFailure,
+  receiptWasInvalidated
+} from "../src/recovery.mjs";
 
 test("first invocation can dispatch", () => {
   assert.equal(decide(undefined, "boot-1", "missing"), "dispatch");
@@ -47,4 +54,24 @@ test("process observation failures are lost only after a proven boot change", ()
   assert.equal(classifyObservationFailure("boot-1", undefined), "unknown");
   assert.equal(classifyObservationFailure("boot-1", "boot-1"), "unknown");
   assert.equal(classifyObservationFailure("boot-1", "boot-2"), "lost");
+});
+
+test("lost receipt ranges remain invalidated across subsequent checkpoints and restores", () => {
+  const firstRestore = addLostSequenceRange([], 4, 9);
+  assert.equal(receiptWasInvalidated(7, firstRestore), true);
+  assert.equal(receiptWasInvalidated(4, firstRestore), false);
+
+  const nextRestore = addLostSequenceRange(firstRestore, 12, 15);
+  assert.deepEqual(nextRestore, [
+    { afterSequence: 4, throughSequence: 9 },
+    { afterSequence: 12, throughSequence: 15 }
+  ]);
+  assert.equal(receiptWasInvalidated(7, nextRestore), true);
+  assert.equal(receiptWasInvalidated(14, nextRestore), true);
+  assert.equal(receiptWasInvalidated(10, nextRestore), false);
+
+  assert.deepEqual(addLostSequenceRange(nextRestore, 9, 12), [
+    { afterSequence: 4, throughSequence: 15 }
+  ]);
+  assert.deepEqual(addLostSequenceRange(nextRestore, 20, 20), nextRestore);
 });
