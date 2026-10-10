@@ -5,3 +5,4 @@ node_modules/
 dist/
 *.log
 worker-configuration.d.ts
+artifacts/
