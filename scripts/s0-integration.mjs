@@ -69,7 +69,8 @@ async function request(path, body, { auth = true, timeoutMs = 190_000 } = {}) {
 }
 
 function expectStatus(response, status, scenario) {
-  assert.equal(response.status, status, `${scenario}: HTTP ${response.status}`);
+  assert.equal(response.status, status,
+    `${scenario}: HTTP ${response.status}; body=${JSON.stringify(response.body)}`);
   return response.body;
 }
 
@@ -86,6 +87,24 @@ async function waitForState(predicate, label, timeoutMs = 45_000) {
     await sleep(500);
   }
   throw new Error(`Timed out waiting for ${label}; last state: ${JSON.stringify(last)}`);
+}
+
+async function collectProbeToExit(id, command, scenario, timeoutMs = 150_000) {
+  const first = expectStatus(await request("/api/probe", { id, command }), 200, scenario);
+  let result = first;
+  const started = Date.now();
+  while (result.state !== "exited" && Date.now() - started < timeoutMs) {
+    if (result.state === "lost") break;
+    // Re-observe the same durable command ID. The runner must collect its
+    // existing process/receipt; this retry is not permission to redispatch.
+    await sleep(500);
+    result = expectStatus(await request("/api/probe", { id, command }), 200, `${scenario} reattachment`);
+  }
+  assert.equal(result.state, "exited",
+    `${scenario}: did not settle as exited; last=${JSON.stringify(resultSummary(result))}`);
+  const settled = await state();
+  assert.equal(settled.activeIntent, null, `${scenario}: settled receipt must release the active writer gate`);
+  return { firstClassification: first.state, result, recoveryDurationMs: Date.now() - started };
 }
 
 async function evidence(path) {
@@ -270,13 +289,17 @@ try {
   });
 
   const baseFileMarker = `base-${testId}`;
-  expectStatus(await request("/api/probe", {
-    id: `base-${testId}`,
-    command: `printf '%s\\n' ${baseFileMarker} > /workspace/pits/baseline.txt`
-  }), 200, "create baseline");
+  const baselineCommand = `printf '%s\\n' ${baseFileMarker} > /workspace/pits/baseline.txt`;
+  const baselineResult = await collectProbeToExit(`base-${testId}`, baselineCommand, "create baseline");
   const baselineText = await evidence("baseline.txt");
   assert.equal(baselineText, baseFileMarker + "\n");
   const baselineHash = sha256(baselineText);
+  record("baseline-command-settled", {
+    pass: true, commandId: baselineResult.result.commandId,
+    firstClassification: baselineResult.firstClassification,
+    finalClassification: baselineResult.result.state, effects: 1,
+    recoveryDurationMs: baselineResult.recoveryDurationMs
+  });
   const checkpointStarted = Date.now();
   const checkpoint = expectStatus(await request("/api/checkpoint", {}), 200, "initial checkpoint");
   assert.ok(checkpoint.backup.size > 0);
