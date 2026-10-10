@@ -266,7 +266,17 @@ export default {
     if (!env.PITS_API_TOKEN || request.headers.get("Authorization") !== "Bearer " + env.PITS_API_TOKEN) {
       return new Response("Unauthorized", { status: 401 });
     }
-    const agent = env.PITS.getByName("s0");
+    let objectName = "s0";
+    if (env.PITS_ENABLE_FAULTS === "true" && env.PITS_ENABLE_FIXTURE === "true") {
+      const testId = request.headers.get("X-PITS-Test-ID");
+      if (!testId || !/^[a-z0-9-]{1,63}$/.test(testId)) {
+        return new Response("Missing or invalid test object ID", { status: 400 });
+      }
+      // Reuse one isolated Worker/Container application while giving each
+      // destructive integration run a clean Durable Object identity.
+      objectName = "test-" + testId;
+    }
+    const agent = env.PITS.getByName(objectName);
     try {
       if (pathname === "/api/evidence" && request.method === "GET") {
         const path = new URL(request.url).searchParams.get("path");

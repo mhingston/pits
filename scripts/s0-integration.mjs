@@ -51,6 +51,7 @@ async function request(path, body, { auth = true, timeoutMs = 190_000 } = {}) {
   const headers = {};
   if (auth) headers.Authorization = `Bearer ${token}`;
   if (accessCookie) headers.Cookie = `CF_Authorization=${accessCookie}`;
+  headers["X-PITS-Test-ID"] = testId;
   if (body !== undefined) headers["Content-Type"] = "application/json";
   try {
     const response = await fetch(new URL(path, base), {
