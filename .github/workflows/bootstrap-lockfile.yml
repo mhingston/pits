@@ -30,4 +30,19 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add package-lock.json
           git commit -m "chore(s0): commit resolved dependency lockfile"
-          git push origin HEAD:refs/heads/feat/s0-durable-sandbox-spike
+          # The S0 branch may advance while npm resolves packages. Rebase
+          # the generated lockfile onto its latest HEAD before pushing.
+          for attempt in 1 2 3; do
+            git fetch origin feat/s0-durable-sandbox-spike
+            if git cat-file -e origin/feat/s0-durable-sandbox-spike:package-lock.json 2>/dev/null; then
+              echo "Another job committed the lockfile; nothing to do"
+              exit 0
+            fi
+            git rebase origin/feat/s0-durable-sandbox-spike
+            if git push origin HEAD:refs/heads/feat/s0-durable-sandbox-spike; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Could not push lockfile after retries" >&2
+          exit 1
