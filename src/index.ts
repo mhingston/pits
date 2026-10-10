@@ -9,6 +9,8 @@ import { SandboxRunner } from "./runner";
 import type { FaultStage } from "./runner";
 
 const FIXTURE_PROMPT = /^pits-fixture:([a-z0-9-]{1,63})$/;
+const PI_REOBSERVE_DEADLINE_MS = 4 * 60_000;
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 function fixtureText(context: TranscriptContext): { marker: string; toolState?: string } | undefined {
   let index = -1;
@@ -97,9 +99,20 @@ export class PitsAgent extends DurableObject<Env> {
             replay: "safe",
             executionMode: "sequential",
             execute: async ({ command }, api) => {
-              const result = await this.runner.execute(String(api.taskId), command);
+              const taskId = String(api.taskId);
+              const started = Date.now();
+              let reobservations = 0;
+              let result = await this.runner.execute(taskId, command);
+              while (result.state === "unknown" && Date.now() - started < PI_REOBSERVE_DEADLINE_MS) {
+                // Keep a possibly-running Pi tool open after an ambiguous
+                // observation. The stable task ID can only reattach/collect;
+                // runner no-redispatch state forbids a second launch.
+                await delay(1_000);
+                reobservations++;
+                result = await this.runner.execute(taskId, command);
+              }
               return {
-                content: [{ type: "text", text: JSON.stringify(result) }],
+                content: [{ type: "text", text: JSON.stringify({ ...result, reobservations }) }],
                 isError: result.state !== "exited" || result.exitCode !== 0
               };
             }
@@ -215,15 +228,20 @@ export class PitsAgent extends DurableObject<Env> {
       .filter(message => message.role === "toolResult" && message.toolName === "sandbox_bash")
       .reverse()
       .find(message => message.role === "toolResult");
-    let command: { commandId?: string; state?: string; exitCode?: number } | null = null;
+    let command: {
+      commandId?: string; state?: string; exitCode?: number; reobservations?: number
+    } | null = null;
     if (toolResult) {
       const text = toolResult.content.filter(block => block.type === "text").map(block => block.text).join("\n");
       try {
-        const parsed = JSON.parse(text) as { commandId?: unknown; state?: unknown; exitCode?: unknown };
+        const parsed = JSON.parse(text) as {
+          commandId?: unknown; state?: unknown; exitCode?: unknown; reobservations?: unknown
+        };
         command = {
           ...(typeof parsed.commandId === "string" ? { commandId: parsed.commandId } : {}),
           ...(typeof parsed.state === "string" ? { state: parsed.state } : {}),
-          ...(typeof parsed.exitCode === "number" ? { exitCode: parsed.exitCode } : {})
+          ...(typeof parsed.exitCode === "number" ? { exitCode: parsed.exitCode } : {}),
+          ...(typeof parsed.reobservations === "number" ? { reobservations: parsed.reobservations } : {})
         };
       } catch { /* Pi keeps the tool entry even if its payload was truncated. */ }
     }

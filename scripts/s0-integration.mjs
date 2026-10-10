@@ -162,6 +162,7 @@ function deployTestWorker(faults, fixture) {
     delete env.PITS_ACCESS_COOKIE;
     const child = spawn("npx", [
       "wrangler", "deploy", "--config", "wrangler.s0-test.jsonc",
+      "--name", workerName,
       "--var", `PITS_ENABLE_FAULTS:${faults}`,
       "--var", `PITS_ENABLE_FIXTURE:${fixture}`
     ], { cwd: process.cwd(), env, stdio: ["ignore", "pipe", "pipe"] });
@@ -325,6 +326,7 @@ try {
   record("piharness-post-checkpoint-effect", {
     pass: true, commandId: postCheckpointPi.command?.commandId ?? null,
     classification: postCheckpointPi.command?.state, effects: 1,
+    piReobservations: postCheckpointPi.command?.reobservations ?? null,
     activeTranscriptEntriesBeforeRestore: piTranscriptBeforeRestore.pi.messageCount,
     checkpointTranscriptAnchor: checkpoint.transcriptAnchor ?? null
   });
