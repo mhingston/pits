@@ -234,11 +234,11 @@ export class PitsAgent extends DurableObject<Env> {
       }
     };
   }
-  async testStatus(workerMode: TestMode) {
-    if (workerMode.faultsEnabled || workerMode.fixtureEnabled) {
-      await storeTestMode(this.ctx.storage, workerMode);
-    }
+  async testStatus() {
     return loadTestMode(this.ctx.storage);
+  }
+  async enableTestMode(mode: TestMode) {
+    return storeTestMode(this.ctx.storage, mode);
   }
   async disableTestMode() {
     await storeTestMode(this.ctx.storage, { faultsEnabled: false, fixtureEnabled: false });
@@ -303,7 +303,8 @@ export default {
       return new Response("Unauthorized", { status: 401 });
     }
     const testId = request.headers.get("X-PITS-Test-ID");
-    const testControlRequest = pathname === "/api/test/status" || pathname === "/api/test/disable";
+    const testControlRequest = pathname === "/api/test/status" || pathname === "/api/test/enable" ||
+      pathname === "/api/test/disable";
     let objectName = "s0";
     const validTestId = testId !== null && /^[a-z0-9-]{1,63}$/.test(testId);
     if (validTestId) {
@@ -318,14 +319,11 @@ export default {
     const agent = env.PITS.getByName(objectName);
     try {
       if (objectName !== "s0" && !testControlRequest) {
-        const mode = await agent.testStatus({ faultsEnabled: false, fixtureEnabled: false });
+        const mode = await agent.testStatus();
         if (!mode.faultsEnabled && !mode.fixtureEnabled) return new Response("Not found", { status: 404 });
       }
       if (pathname === "/api/test/status" && request.method === "GET") {
-        const durableObject = await agent.testStatus({
-          faultsEnabled: env.PITS_ENABLE_FAULTS === "true",
-          fixtureEnabled: env.PITS_ENABLE_FIXTURE === "true"
-        });
+        const durableObject = await agent.testStatus();
         return Response.json({
           ...durableObject,
           workerFaultsEnabled: env.PITS_ENABLE_FAULTS === "true",
@@ -333,6 +331,12 @@ export default {
           objectName,
           requestedTestId: request.headers.get("X-PITS-Test-ID")
         });
+      }
+      if (pathname === "/api/test/enable" && request.method === "POST") {
+        if (env.PITS_ENABLE_FAULTS !== "true" || env.PITS_ENABLE_FIXTURE !== "true") {
+          return new Response("Test switches are not enabled on this Worker version", { status: 404 });
+        }
+        return Response.json(await agent.enableTestMode({ faultsEnabled: true, fixtureEnabled: true }));
       }
       if (pathname === "/api/test/disable" && request.method === "POST") {
         return Response.json(await agent.disableTestMode());
@@ -390,20 +394,20 @@ export default {
         return Response.json(await agent.ask(body.prompt));
       }
       if (pathname === "/api/ask-fixture") {
-        const mode = await agent.testStatus({ faultsEnabled: false, fixtureEnabled: false });
+        const mode = await agent.testStatus();
         if (!mode.fixtureEnabled) return new Response("Not found", { status: 404 });
         const body = await request.json() as { marker?: unknown };
         if (typeof body.marker !== "string") return new Response("Expected marker string", { status: 400 });
         return Response.json(await agent.askFixture(body.marker));
       }
       if (pathname === "/api/destroy") {
-        const mode = await agent.testStatus({ faultsEnabled: false, fixtureEnabled: false });
+        const mode = await agent.testStatus();
         if (!mode.faultsEnabled) return new Response("Not found", { status: 404 });
         await agent.destroyForTest();
         return Response.json({ destroyed: true });
       }
       if (pathname === "/api/abort") {
-        const mode = await agent.testStatus({ faultsEnabled: false, fixtureEnabled: false });
+        const mode = await agent.testStatus();
         if (!mode.faultsEnabled) return new Response("Not found", { status: 404 });
         await agent.abortForTest();
         return Response.json({ aborted: true });

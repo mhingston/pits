@@ -316,13 +316,23 @@ try {
   let routing;
   let lastRoutingResponse;
   let stableRoutingSamples = 0;
+  let testModeEnabled = false;
   while (Date.now() - routingStartedAt < 120_000) {
     const response = await request("/api/test/status");
     lastRoutingResponse = { status: response.status, body: response.body };
-    if (response.status === 200 && response.body.faultsEnabled === true &&
-      response.body.fixtureEnabled === true && response.body.workerFaultsEnabled === true &&
+    const correctRouting = response.status === 200 && response.body.workerFaultsEnabled === true &&
       response.body.workerFixtureEnabled === true && response.body.objectName === `test-${testId}` &&
-      response.body.requestedTestId === testId) {
+      response.body.requestedTestId === testId;
+    if (correctRouting && !testModeEnabled) {
+      const enabledMode = await request("/api/test/enable", {});
+      if (enabledMode.status === 200 && enabledMode.body.faultsEnabled === true &&
+          enabledMode.body.fixtureEnabled === true) {
+        testModeEnabled = true;
+        record("durable-test-mode-enabled", { pass: true, objectName: `test-${testId}` });
+      }
+      stableRoutingSamples = 0;
+    } else if (correctRouting && testModeEnabled && response.body.faultsEnabled === true &&
+        response.body.fixtureEnabled === true) {
       stableRoutingSamples++;
       if (stableRoutingSamples >= 5) {
         routing = response.body;
