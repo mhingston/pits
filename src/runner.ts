@@ -7,6 +7,7 @@ import {
   classifyObservationFailure,
   receiptWasInvalidated
 } from "./recovery.mjs";
+import { checkpointKey, ownerBackupPrefix, collectOwnedOrphans, ORPHAN_GRACE_MS, LEGACY_BACKUP_PREFIX } from "./backup-retention.mjs";
 import { isSafeForegroundCommand, RUN, STATUS } from "./process-protocol.mjs";
 
 const ROOT = "/var/lib/pits-processes";
@@ -36,10 +37,12 @@ export interface Result {
 }
 interface Checkpoint {
   backup: DirectoryBackupRecord;
+  backupPrefix?: string;
   bootId: string;
   commandId: string | null;
   createdAt: number;
   sequence: number;
+  gitState?: { head: string | null; tree: string | null; status: string };
   transcriptAnchor?: {
     sessionId: string;
     entryId: string | null;
@@ -75,6 +78,7 @@ function delay(ms: number): Promise<void> {
 
 export class SandboxRunner {
   private readonly backups: DirectoryBackup;
+  private readonly backupPrefix: string;
   private readonly container: Container;
   private readonly storage: DurableObjectStorage;
 
@@ -82,13 +86,8 @@ export class SandboxRunner {
     if (!ctx.container) throw new Error("Sandbox container binding is missing");
     this.container = ctx.container;
     this.storage = ctx.storage;
-    this.backups = new DirectoryBackup(
-      ctx.container,
-      // Wrangler types do not yet include this WorkerEntrypoint on Exports;
-      // the gateway is exported by src/index.ts as required by SDK 1.0.
-      (ctx.exports as unknown as { DirectoryBackupGateway: DirectoryBackupGatewayBinding }).DirectoryBackupGateway,
-      { binding: "BACKUPS", prefix: "pits-s0/" }
-    );
+    this.backupPrefix = ownerBackupPrefix(ctx.id.toString());
+    this.backups = this.directoryBackup(this.backupPrefix);
     // A DO restart terminates any in-flight DirectoryBackup helper. Therefore
     // a persisted maintenance marker at construction is stale and must not
     // wedge checkpoint/restore forever. PiHarness owns alarms; never set one.
@@ -96,6 +95,16 @@ export class SandboxRunner {
       if (await this.storage.get<boolean>("maintenance")) await this.storage.delete("maintenance");
       if (this.container.running) await this.container.setInactivityTimeout(TIMEOUT_MS);
     });
+  }
+
+  private directoryBackup(prefix: string): DirectoryBackup {
+    return new DirectoryBackup(
+      this.container,
+      // Wrangler types do not yet include this WorkerEntrypoint on Exports;
+      // the gateway is exported by src/index.ts as required by SDK 1.0.
+      (this.ctx.exports as unknown as { DirectoryBackupGateway: DirectoryBackupGatewayBinding }).DirectoryBackupGateway,
+      { binding: "BACKUPS", prefix }
+    );
   }
 
   private async ensureContainer(): Promise<{ bootId: string }> {
@@ -377,6 +386,7 @@ export class SandboxRunner {
         if (fixture.exitCode !== 0) throw new Error("Cannot prepare backup interruption fixture: " + fixture.stderr);
         await this.backupBucket.put(BACKUP_FAULT_ARM_KEY, String(Date.now()));
       }
+      const gitState = await this.gitState();
       const options = {
         dir: WORKSPACE, exclude: ["node_modules/", ".cache/"]
       };
@@ -413,14 +423,41 @@ export class SandboxRunner {
       const backup = await backupPromise;
       await this.injectFault(faultAt, "after_backup_before_checkpoint");
       const point: Checkpoint = {
-        backup, bootId,
+        backup, backupPrefix: this.backupPrefix, bootId, gitState,
         commandId: await this.storage.get<string>("last-command") ?? null,
         createdAt: Date.now(),
         sequence: await this.storage.get<number>("command-sequence") ?? 0,
         ...(transcriptAnchor ? { transcriptAnchor } : {})
       };
       await this.storage.put("checkpoint", point);
+      // Collection failure does not roll back a committed checkpoint; it is
+      // recorded and retried by the next checkpoint or explicit maintenance.
+      try { await this.collectOrphansLocked(Date.now() - ORPHAN_GRACE_MS); }
+      catch { await this.storage.put("backup-gc-error-at", Date.now()); }
       return point;
+    } finally {
+      await this.storage.delete("maintenance");
+    }
+  }
+
+  private async collectOrphansLocked(cutoff: number) {
+    const protectedKeys = [
+      checkpointKey(await this.storage.get<Checkpoint>("checkpoint")),
+      checkpointKey(await this.storage.get<Checkpoint>("restored-checkpoint"))
+    ];
+    // Maintenance excludes checkpoint/restore and command writers throughout
+    // the list/delete window. A helper from a dead DO can upload late, but
+    // cannot commit metadata; newly completed objects get the full grace.
+    const result = await collectOwnedOrphans(this.backupBucket, this.backupPrefix, protectedKeys, cutoff);
+    await this.storage.delete("backup-gc-error-at");
+    await this.storage.put("backup-gc-last-run", { at: Date.now(), scanned: result.scanned, deletedCount: result.deleted.length });
+    return result;
+  }
+
+  async collectOrphans(forTest = false) {
+    await this.beginMaintenance();
+    try {
+      return await this.collectOrphansLocked(Date.now() - (forTest ? 0 : ORPHAN_GRACE_MS));
     } finally {
       await this.storage.delete("maintenance");
     }
@@ -445,7 +482,7 @@ export class SandboxRunner {
           throw new Error("Cannot restore over a possibly running command in this boot");
         }
       }
-      await this.backups.restore(point.backup);
+      await this.directoryBackup(point.backupPrefix ?? LEGACY_BACKUP_PREFIX).restore(point.backup);
       await this.storage.transaction(async tx => {
         await tx.delete("active");
         await tx.put("restore-required", false);
@@ -458,6 +495,80 @@ export class SandboxRunner {
         await tx.put("restored-checkpoint", point);
       });
       return point;
+    } finally {
+      await this.storage.delete("maintenance");
+    }
+  }
+
+  private async gitState(): Promise<{ head: string | null; tree: string | null; status: string }> {
+    const repository = await this.sh(["git", "rev-parse", "--is-inside-work-tree"], WORKSPACE);
+    if (repository.exitCode !== 0) return { head: null, tree: null, status: "not-a-repository" };
+    const head = await this.sh(["git", "rev-parse", "--verify", "HEAD"], WORKSPACE);
+    const tree = await this.sh(["git", "rev-parse", "--verify", "HEAD^{tree}"], WORKSPACE);
+    const status = await this.sh(["git", "status", "--porcelain=v1", "--untracked-files=all"], WORKSPACE);
+    if (status.exitCode !== 0) throw new Error("Cannot capture checkpoint Git status");
+    return { head: head.exitCode === 0 ? head.stdout.trim() : null,
+      tree: tree.exitCode === 0 ? tree.stdout.trim() : null, status: status.stdout };
+  }
+
+  // Actual tracked PITS files supplied by the test harness, plus bounded stress
+  // data. No network, credentials, shell interpolation or billable model.
+  async representativeFixture(files?: { path: string; base64: string }[]) {
+    await this.beginMaintenance();
+    try {
+      await this.ensureContainer();
+      if (await this.storage.get<boolean>("restore-required") ||
+          await this.storage.get<boolean>("reconciliation-required")) {
+        throw new Error("Fixture requires a reconciled workspace");
+      }
+      if (files) {
+        if (!files.length || files.length > 500 || files.reduce((n, f) => n + f.base64.length, 0) > 8 * 1024 * 1024) {
+          throw new Error("Repository fixture exceeds test limits");
+        }
+        // Validate the entire input before writing anything. Only regular files
+        // from git ls-files are supplied; refuse .git and excluded directories.
+        const paths = new Set<string>();
+        for (const file of files) {
+          if (!/^[A-Za-z0-9._/-]{1,200}$/.test(file.path) ||
+              file.path.split("/").some(part => ["", ".", "..", ".git", "node_modules", ".cache"].includes(part)) ||
+              paths.has(file.path) || !/^[A-Za-z0-9+/]*={0,2}$/.test(file.base64)) {
+            throw new Error("Invalid repository fixture file");
+          }
+          paths.add(file.path);
+        }
+        for (const file of files) {
+          const path = WORKSPACE + "/" + file.path;
+          await this.sh(["mkdir", "-p", path.slice(0, path.lastIndexOf("/"))]);
+          const bytes = Uint8Array.from(atob(file.base64), char => char.charCodeAt(0));
+          const proc = await this.container.exec(["tee", path], {
+            stdin: new ReadableStream({ start(controller) { controller.enqueue(bytes); controller.close(); } }),
+            stdout: "ignore", stderr: "pipe"
+          });
+          if ((await proc.output()).exitCode !== 0) throw new Error("Cannot write repository fixture file");
+        }
+        const result = await this.sh(["sh", "-ec", `
+          mkdir -p node_modules .cache
+          dd if=/dev/urandom of=node_modules/excluded.bin bs=1M count=64
+          printf excluded > node_modules/excluded.txt
+          printf excluded > .cache/excluded.txt
+          git init -q
+          git add .
+          git -c user.name=S0 -c user.email=s0@example.invalid commit -qm repository-fixture
+          printf '\nS0 dirty tracked fixture\n' >> README.md
+          printf 'untracked fixture\n' > untracked-fixture.txt
+          dd if=/dev/urandom of=fixture-large.bin bs=1M count=64
+        `], WORKSPACE);
+        if (result.exitCode !== 0) throw new Error("Fixture preparation failed: " + result.stderr);
+      }
+      const manifest = await this.sh(["sh", "-ec", "find . -type f ! -path './.git/*' ! -path './node_modules/*' ! -path './.cache/*' -print0 | sort -z | xargs -0 sha256sum"], WORKSPACE);
+      if (manifest.exitCode !== 0) throw new Error("Cannot hash representative repository");
+      const stats = await this.sh(["sh", "-ec", "git ls-files | wc -l; du -sb .; du -sb node_modules 2>/dev/null || true"], WORKSPACE);
+      const excluded = await this.sh(["sh", "-c", "test -e node_modules/excluded.txt || test -e .cache/excluded.txt"], WORKSPACE);
+      return {
+        manifestSha256: await hash(manifest.stdout), gitState: await this.gitState(),
+        repositoryStats: stats.stdout, largeFileBytes: 64 * 1024 * 1024,
+        excludedFilesPresent: excluded.exitCode === 0
+      };
     } finally {
       await this.storage.delete("maintenance");
     }
@@ -514,6 +625,9 @@ export class SandboxRunner {
       restoreRequired: (await this.storage.get<boolean>("restore-required")) ?? false,
       reconciliationRequired: (await this.storage.get<boolean>("reconciliation-required")) ?? false,
       commandSequence: await this.storage.get<number>("command-sequence") ?? 0,
+      backupPrefix: this.backupPrefix,
+      backupGc: await this.storage.get("backup-gc-last-run") ?? null,
+      backupGcErrorAt: await this.storage.get("backup-gc-error-at") ?? null,
       checkpoint: (await this.storage.get<Checkpoint>("checkpoint")) ?? null,
       restoredCheckpoint: (await this.storage.get<Checkpoint>("restored-checkpoint")) ?? null
     };

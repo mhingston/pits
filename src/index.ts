@@ -216,6 +216,14 @@ export class PitsAgent extends DurableObject<Env> {
     await session.reset(handoff);
     return checkpoint;
   }
+  async representativeFixture(files?: { path: string; base64: string }[]) {
+    if (!(await loadTestMode(this.ctx.storage)).fixtureEnabled) throw new Error("Fixture is disabled");
+    return this.runner.representativeFixture(files);
+  }
+  async collectBackups(forTest = false) {
+    if (forTest && !(await loadTestMode(this.ctx.storage)).faultsEnabled) throw new Error("Fault injection is disabled");
+    return this.runner.collectOrphans(forTest);
+  }
   async readEvidence(path: string) { return this.runner.readEvidence(path); }
   async reconcile(checkpointId: string) { return this.runner.acknowledgeReconciliation(checkpointId); }
   async inspect() {
@@ -341,6 +349,15 @@ export default {
       if (pathname === "/api/test/disable" && request.method === "POST") {
         return Response.json(await agent.disableTestMode());
       }
+      if (pathname === "/api/test/representative" && request.method === "POST") {
+        if (objectName === "s0") return new Response("Not found", { status: 404 });
+        const body = await request.json() as { files?: { path: string; base64: string }[] };
+        if (body.files !== undefined && (!Array.isArray(body.files) ||
+            body.files.some(file => typeof file?.path !== "string" || typeof file?.base64 !== "string"))) {
+          return new Response("Expected repository files", { status: 400 });
+        }
+        return Response.json(await agent.representativeFixture(body.files));
+      }
       if (pathname === "/api/evidence" && request.method === "GET") {
         const path = new URL(request.url).searchParams.get("path");
         if (!path) return new Response("Missing path", { status: 400 });
@@ -366,6 +383,13 @@ export default {
           return new Response("Unknown test fault stage", { status: 400 });
         }
         return Response.json(await agent.runProbe(body.id, body.command, body.faultAt as FaultStage | undefined));
+      }
+      if (pathname === "/api/backups/collect") {
+        return Response.json(await agent.collectBackups());
+      }
+      if (pathname === "/api/test/collect-backups") {
+        if (objectName === "s0") return new Response("Not found", { status: 404 });
+        return Response.json(await agent.collectBackups(true));
       }
       if (pathname === "/api/checkpoint") {
         const body = request.headers.get("Content-Type")?.includes("application/json")

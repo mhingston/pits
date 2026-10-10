@@ -13,6 +13,7 @@ const workerName = process.env.PITS_WORKER_NAME ?? "pits-s0-test-recovery";
 const predeployed = process.env.PITS_TEST_PREDEPLOYED === "true";
 const iterations = Number(process.env.PITS_ITERATIONS ?? 10);
 const onlyFaultStage = process.env.PITS_TEST_ONLY_FAULT_STAGE;
+const representativeOnly = process.env.PITS_TEST_REPRESENTATIVE === "true";
 const onlyCheckpointFault = process.env.PITS_TEST_ONLY_CHECKPOINT_FAULT;
 const testId = process.env.PITS_TEST_ID ??
   `${new Date().toISOString().replace(/[^0-9]/g, "").slice(0, 14)}-${randomBytes(4).toString("hex")}`;
@@ -26,7 +27,7 @@ assert.ok(onlyFaultStage === undefined || onlyFaultStage === "after_exit_before_
   "PITS_TEST_ONLY_FAULT_STAGE currently supports after_exit_before_receipt only");
 assert.ok(onlyCheckpointFault === undefined || onlyCheckpointFault === "during_backup",
   "PITS_TEST_ONLY_CHECKPOINT_FAULT currently supports during_backup only");
-assert.ok(!(onlyFaultStage && onlyCheckpointFault), "Choose only one focused test mode");
+assert.ok([onlyFaultStage, onlyCheckpointFault, representativeOnly].filter(Boolean).length <= 1, "Choose only one focused test mode");
 const base = new URL(baseUrl);
 assert.equal(base.protocol, "https:", "Live integration tests require HTTPS");
 assert.ok(!["localhost", "127.0.0.1", "::1"].includes(base.hostname), "Local emulation is not live Cloudflare evidence");
@@ -41,7 +42,8 @@ const sourceCommit = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf
 const lock = JSON.parse(readFileSync(new URL("../package-lock.json", import.meta.url), "utf8"));
 const versions = Object.fromEntries(["@cloudflare/sandbox", "agents", "@earendil-works/pi-durable", "@earendil-works/pi-ai", "wrangler"]
   .map(name => [name, lock.packages[`node_modules/${name}`]?.version ?? "unknown"]));
-const common = { testId, worker: workerName, sourceCommit, versions, containerImage: "cloudflare/sandbox:1.0.0" };
+const sourceDiffSha256 = createHash("sha256").update(execFileSync("git", ["diff", "HEAD", "--", "src", "scripts", "Dockerfile", "package-lock.json"])).digest("hex");
+const common = { testId, worker: workerName, sourceCommit, sourceDiffSha256, versions, containerImage: "cloudflare/sandbox:1.0.0" };
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const sha256 = value => createHash("sha256").update(value).digest("hex");
 const redact = value => String(value)
@@ -370,6 +372,53 @@ try {
         bootIdAfter: after.boot, recoveryDurationMs: recovered.recoveryDurationMs
       });
     }
+  } else if (representativeOnly) {
+    const repositoryFiles = execFileSync("git", ["ls-files", "-z"], { encoding: "utf8" })
+      .split("\0").filter(Boolean).map(path => ({ path, base64: readFileSync(path).toString("base64") }));
+    const fixture = expectStatus(await request("/api/test/representative", { files: repositoryFiles }), 200, "prepare representative repository");
+    const started = Date.now();
+    const checkpoint = expectStatus(await request("/api/checkpoint", {}), 200, "commit representative checkpoint");
+    const backupDurationMs = Date.now() - started;
+    assert.ok(checkpoint.backup.size > 64 * 1024 * 1024, "incompressible representative archive committed");
+    assert.deepEqual(checkpoint.gitState, fixture.gitState);
+    expectStatus(await request("/api/probe", { id: `diverge-${testId}`, command: "rm -f /workspace/pits/fixture-large.bin" }), 200, "diverge representative workspace");
+    expectStatus(await request("/api/destroy", {}), 200, "destroy representative container");
+    const restoreStarted = Date.now();
+    expectStatus(await request("/api/restore", {}), 200, "restore representative checkpoint");
+    const restoreDurationMs = Date.now() - restoreStarted;
+    const restoredState = await state();
+    assert.equal(restoredState.reconciliationRequired, true);
+    assert.notEqual(restoredState.boot, checkpoint.bootId, "representative restore uses a replacement container");
+    expectStatus(await request("/api/reconcile", { checkpointId: checkpoint.backup.id }), 200, "reconcile representative restore");
+    const restored = expectStatus(await request("/api/test/representative", {}), 200, "verify restored repository");
+    assert.equal(restored.manifestSha256, fixture.manifestSha256);
+    assert.deepEqual(restored.gitState, fixture.gitState);
+    assert.equal(restored.excludedFilesPresent, false);
+    record("representative-checkpoint", { pass: true, fixture, restored, checkpoint,
+      backupDurationMs, restoreDurationMs, containerReplaced: restoredState.boot !== checkpoint.bootId });
+    assert.match(fixture.gitState.status, / M README.md/, "dirty tracked state is recorded");
+    assert.match(fixture.gitState.status, /\?\? untracked-fixture.txt/, "untracked state is recorded");
+    // Protect both the current checkpoint and the older restored checkpoint.
+    const newer = expectStatus(await request("/api/checkpoint", {}), 200, "new checkpoint for retention");
+    await invokeCheckpointFault("after_backup_before_checkpoint");
+    assert.equal((await state()).checkpoint.backup.id, newer.backup.id);
+    await sleep(1000);
+    const grace = expectStatus(await request("/api/backups/collect", {}), 200, "production retention grace");
+    assert.equal(grace.deleted.length, 0, "new orphan receives the full production grace period");
+    const collected = expectStatus(await request("/api/test/collect-backups", {}), 200, "collect completed orphan without test grace");
+    assert.equal(collected.deleted.length, 1, "only the post-upload pre-commit orphan is deleted");
+    assert.ok(collected.protectedKeys.includes(`${checkpoint.backupPrefix}${checkpoint.backup.id}.tar.zst`));
+    assert.ok(collected.protectedKeys.includes(`${newer.backupPrefix}${newer.backup.id}.tar.zst`));
+    assert.equal(collected.scanned, 3, "both protected archives and the orphan were listed");
+    const repeated = expectStatus(await request("/api/test/collect-backups", {}), 200, "repeat completed orphan collection");
+    assert.equal(repeated.deleted.length, 0, "collection is idempotent");
+    expectStatus(await request("/api/restore", {}), 200, "retained checkpoint remains restorable");
+    expectStatus(await request("/api/reconcile", { checkpointId: newer.backup.id }), 200, "reconcile retained checkpoint");
+    const retained = expectStatus(await request("/api/test/representative", {}), 200, "verify retained archive after collection");
+    assert.equal(retained.manifestSha256, fixture.manifestSha256);
+    assert.deepEqual(retained.gitState, fixture.gitState);
+    record("completed-orphan-retention", { pass: true, grace, collected, repeated,
+      restoredCheckpointId: newer.backup.id, restoredManifestSha256: retained.manifestSha256 });
   } else if (onlyCheckpointFault) {
     const marker = `checkpoint-only-${testId}`;
     const path = "checkpoint-only.txt";
