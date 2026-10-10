@@ -414,14 +414,30 @@ try {
     const command = appendCommand(marker, `dedup-${i}.txt`);
     const first = expectStatus(await request("/api/probe", { id, command }), 200, "dedup first");
     const duplicate = expectStatus(await request("/api/probe", { id, command }), 200, "dedup duplicate");
-    assert.deepEqual(resultSummary(duplicate), resultSummary(first));
+    assert.equal(duplicate.commandId, first.commandId, "duplicate observes the original command ID");
+    assert.ok(["unknown", "exited"].includes(first.state), "first submission is either settled or conservatively ambiguous");
+    const classifications = [first.state, duplicate.state];
+    const settleStartedAt = Date.now();
+    let settledDuplicate = duplicate;
+    while (settledDuplicate.state !== "exited" && Date.now() - settleStartedAt < 150_000) {
+      assert.equal(settledDuplicate.state, "unknown", "duplicate may only advance the same uncertain command");
+      await sleep(500);
+      settledDuplicate = expectStatus(await request("/api/probe", { id, command }), 200, "dedup result reattachment");
+      assert.equal(settledDuplicate.commandId, first.commandId, "reattachment observes the same command ID");
+      classifications.push(settledDuplicate.state);
+    }
+    assert.equal(settledDuplicate.state, "exited", "same-ID retry eventually collects the original result");
+    if (first.state === "exited") assert.deepEqual(resultSummary(duplicate), resultSummary(first));
     const different = await request("/api/probe", { id, command: appendCommand("different", `dedup-${i}.txt`) });
     assert.equal(different.status, 409, "same ID with different arguments is rejected");
     const effects = await markerCount(`dedup-${i}.txt`, marker);
     assert.equal(effects, 1);
+    assert.equal((await state()).activeIntent, null, "settled duplicate releases the active mutation gate");
     record("duplicate-command", {
       pass: true, iteration: i + 1, commandId: first.commandId,
-      classification: first.state, effects, sameResult: true, differentArgumentsRejected: true
+      classificationProgression: classifications, finalClassification: settledDuplicate.state,
+      effects, sameCommandId: true, differentArgumentsRejected: true,
+      recoveryDurationMs: Date.now() - settleStartedAt
     });
   }
 
