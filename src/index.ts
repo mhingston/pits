@@ -10,7 +10,7 @@ import { SandboxRunner } from "./runner";
 import type { FaultStage } from "./runner";
 import { loadTestMode, storeTestMode, type TestMode } from "./test-mode.mjs";
 
-const CHECKPOINT_PROTOCOL = "owner-retention-git-generation-v3";
+const CHECKPOINT_PROTOCOL = "owner-retention-git-generation-v4";
 const FIXTURE_PROMPT = /^pits-fixture:([a-z0-9-]{1,63})$/;
 const PI_REOBSERVE_DEADLINE_MS = 4 * 60_000;
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -74,7 +74,7 @@ export class DirectoryBackupGateway extends SandboxDirectoryBackupGateway {
 }
 
 const FAULT_STAGES: readonly FaultStage[] = [
-  "before_intent", "after_intent", "after_reservation", "after_launch",
+  "before_intent", "after_intent", "destroy_before_reservation", "after_reservation", "after_launch",
   "after_exit_before_receipt", "after_receipt", "during_backup", "after_backup_before_checkpoint"
 ];
 const CHECKPOINT_FAULT_STAGES: readonly FaultStage[] = ["during_backup", "after_backup_before_checkpoint"];

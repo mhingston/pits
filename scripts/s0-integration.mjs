@@ -341,7 +341,7 @@ try {
     const correctRouting = response.status === 200 && response.body.workerFaultsEnabled === true &&
       response.body.workerFixtureEnabled === true && response.body.objectName === `test-${testId}` &&
       response.body.requestedTestId === testId && response.body.workerSourceRevision === sourceCommit &&
-      response.body.checkpointProtocol === "owner-retention-git-generation-v3";
+      response.body.checkpointProtocol === "owner-retention-git-generation-v4";
     if (correctRouting && !testModeEnabled) {
       const enabledMode = await request("/api/test/enable", {});
       if (enabledMode.status === 200 && enabledMode.body.faultsEnabled === true &&
@@ -835,6 +835,26 @@ try {
         recoveryDurationMs: Date.now() - faultStarted
       });
     }
+  }
+
+  // Deterministically lose the container after intent but before mkdir/launch.
+  // This must produce a structured lost result, including through the Pi tool,
+  // rather than leaking an exec error into an unclassified tool transcript.
+  for (let i = 0; i < iterations; i++) {
+    const id = `pre-reservation-${testId}-${i}`, marker = `pre-reservation-${i}`;
+    const command = appendCommand(marker, "pre-reservation.txt");
+    const result = expectStatus(await request("/api/probe", {
+      id, command, faultAt: "destroy_before_reservation"
+    }), 200, "container loss before reservation");
+    assert.equal(result.state, "lost");
+    const repeated = expectStatus(await request("/api/probe", { id, command }), 200, "same-ID pre-reservation loss");
+    assert.equal(repeated.state, "lost");
+    assert.equal(await markerCount("pre-reservation.txt", marker), 0);
+    assert.equal((await state()).restoreRequired, true);
+    await restoreAndReconcile(checkpoint, [["baseline.txt", baselineHash]]);
+    expectStatus(await request("/api/reconcile", { checkpointId: checkpoint.backup.id }), 200, "reconcile pre-reservation loss");
+    record("container-loss-before-reservation", { pass: true, iteration: i + 1,
+      commandId: result.commandId, classification: result.state, effects: 0, repeatClassification: repeated.state });
   }
 
   // Publish the same isolated configuration while a bounded mutation is active.

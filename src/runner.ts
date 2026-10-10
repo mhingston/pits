@@ -59,6 +59,7 @@ interface InterruptedBackupUpload {
 export type FaultStage =
   | "before_intent"
   | "after_intent"
+  | "destroy_before_reservation"
   | "after_reservation"
   | "after_launch"
   | "after_exit_before_receipt"
@@ -243,8 +244,14 @@ export class SandboxRunner {
       return this.ambiguous(id, action, "Process state cannot be proven; never redispatch after uncertainty");
     }
     if (action === "dispatch") {
-      await this.sh(["mkdir", "-p", ROOT]);
-      const reserved = await this.sh(["mkdir", ROOT + "/" + id]);
+      if (faultAt === "destroy_before_reservation") await this.container.destroy();
+      let reserved: Awaited<ReturnType<SandboxRunner["sh"]>>;
+      try {
+        await this.sh(["mkdir", "-p", ROOT]);
+        reserved = await this.sh(["mkdir", ROOT + "/" + id]);
+      } catch {
+        return this.observationFailure(id, intent, "Process reservation failed after intent commit");
+      }
       if (reserved.exitCode === 0) {
         // The DO intent was stored BEFORE the container's atomic mkdir.
         // A crash after mkdir but before exec is UNKNOWN, not a retry.
@@ -273,8 +280,14 @@ export class SandboxRunner {
       }
       if (now.kind === "exited") {
         await this.injectFault(faultAt, "after_exit_before_receipt");
-        const stdout = await this.sh(["sh", "-c", 'tail -c 32768 "$1/stdout.log"', "sh", ROOT + "/" + id]);
-        const stderr = await this.sh(["sh", "-c", 'tail -c 32768 "$1/stderr.log"', "sh", ROOT + "/" + id]);
+        let stdout: Awaited<ReturnType<SandboxRunner["sh"]>>;
+        let stderr: Awaited<ReturnType<SandboxRunner["sh"]>>;
+        try {
+          stdout = await this.sh(["sh", "-c", 'tail -c 32768 "$1/stdout.log"', "sh", ROOT + "/" + id]);
+          stderr = await this.sh(["sh", "-c", 'tail -c 32768 "$1/stderr.log"', "sh", ROOT + "/" + id]);
+        } catch {
+          return this.observationFailure(id, intent, "Process output collection failed before receipt commit");
+        }
         const result: Result = {
           state: "exited", commandId: id, exitCode: now.exitCode,
           stdout: stdout.stdout, stderr: stderr.stdout
