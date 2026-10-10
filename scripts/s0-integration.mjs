@@ -93,9 +93,10 @@ async function waitForState(predicate, label, timeoutMs = 45_000) {
   throw new Error(`Timed out waiting for ${label}; last state: ${JSON.stringify(last)}`);
 }
 
-async function collectProbeToExit(id, command, scenario, timeoutMs = 150_000) {
+async function reobserveProbeToTerminal(id, command, scenario, timeoutMs = 150_000) {
   const first = expectStatus(await request("/api/probe", { id, command }), 200, scenario);
   let result = first;
+  const classifications = [first.state];
   const started = Date.now();
   while (result.state !== "exited" && Date.now() - started < timeoutMs) {
     if (result.state === "lost") break;
@@ -103,12 +104,24 @@ async function collectProbeToExit(id, command, scenario, timeoutMs = 150_000) {
     // existing process/receipt; this retry is not permission to redispatch.
     await sleep(500);
     result = expectStatus(await request("/api/probe", { id, command }), 200, `${scenario} reattachment`);
+    classifications.push(result.state);
   }
+  return {
+    firstClassification: first.state,
+    result,
+    classifications,
+    recoveryDurationMs: Date.now() - started
+  };
+}
+
+async function collectProbeToExit(id, command, scenario, timeoutMs = 150_000) {
+  const observed = await reobserveProbeToTerminal(id, command, scenario, timeoutMs);
+  const { result } = observed;
   assert.equal(result.state, "exited",
     `${scenario}: did not settle as exited; last=${JSON.stringify(resultSummary(result))}`);
   const settled = await state();
   assert.equal(settled.activeIntent, null, `${scenario}: settled receipt must release the active writer gate`);
-  return { firstClassification: first.state, result, recoveryDurationMs: Date.now() - started };
+  return observed;
 }
 
 async function evidence(path) {
@@ -464,14 +477,16 @@ try {
     const command = appendCommand(marker, `intent-${i}.txt`);
     const bootBefore = (await state()).boot;
     await invokeFault(id, command, "after_intent");
-    const retry = expectStatus(await request("/api/probe", { id, command }), 200, "recover after intent commit");
+    const retryResult = await collectProbeToExit(id, command, "recover after intent commit");
+    const retry = retryResult.result;
     const effects = await markerCount(`intent-${i}.txt`, marker);
-    assert.equal(retry.state, "exited");
     assert.equal(effects, 1);
     const after = await state();
     record("fault-after-intent", {
       pass: true, iteration: i + 1, commandId: retry.commandId,
-      classification: retry.state, effects, bootIdBefore: bootBefore, bootIdAfter: after.boot
+      classificationProgression: retryResult.classifications, finalClassification: retry.state,
+      effects, bootIdBefore: bootBefore, bootIdAfter: after.boot,
+      recoveryDurationMs: retryResult.recoveryDurationMs
     });
   }
 
@@ -480,10 +495,15 @@ try {
     const marker = `before-intent-${testId}`, id = `before-intent-${testId}`;
     const command = appendCommand(marker, "before-intent.txt");
     await invokeFault(id, command, "before_intent");
-    const retry = expectStatus(await request("/api/probe", { id, command }), 200, "recover before intent");
+    const retryResult = await collectProbeToExit(id, command, "recover before intent");
+    const retry = retryResult.result;
     const effects = await markerCount("before-intent.txt", marker);
     assert.equal(effects, 1);
-    record("fault-before-intent", { pass: true, commandId: retry.commandId, classification: retry.state, effects });
+    record("fault-before-intent", {
+      pass: true, commandId: retry.commandId,
+      classificationProgression: retryResult.classifications, classification: retry.state,
+      effects, recoveryDurationMs: retryResult.recoveryDurationMs
+    });
   }
 
   // A reservation with no published PID is ambiguous; it must not launch again.
@@ -503,7 +523,8 @@ try {
     });
     assert.equal(blocked.status, 409, "uncertain command blocks another mutation");
     await expectStatus(await request("/api/destroy", {}), 200, "destroy ambiguous reservation container");
-    const lost = expectStatus(await request("/api/probe", { id, command }), 200, "classify replaced reservation");
+    const lostObservation = await reobserveProbeToTerminal(id, command, "classify replaced reservation");
+    const lost = lostObservation.result;
     assert.equal(lost.state, "lost");
     assert.equal(await markerCount(`reservation-${i}.txt`, marker), 0);
     const restored = await restoreAndReconcile(checkpoint, [
@@ -547,7 +568,8 @@ try {
     assert.notEqual(interrupted.status, 200, "DO abort interrupted the active request");
     await initialRequest;
     const started = Date.now();
-    const reattached = expectStatus(await request("/api/probe", { id, command }), 200, "reattach after DO restart");
+    const reattachment = await collectProbeToExit(id, command, "reattach after DO restart");
+    const reattached = reattachment.result;
     const after = await state();
     const effects = await markerCount(path, marker);
     assert.equal(reattached.state, "exited");
@@ -556,6 +578,7 @@ try {
     record("do-restart-running-command", {
       iteration: i + 1, processRuntimeSeconds: runSeconds,
       pass: true, commandId: reattached.commandId, classification: reattached.state,
+      classificationProgression: reattachment.classifications,
       effects, bootIdBefore: before.boot, bootIdAfter: after.boot,
       processStateAtAbort: observedRunning.processObservation?.kind,
       recoveryDurationMs: Date.now() - started
@@ -574,14 +597,15 @@ try {
       const bootBefore = (await state()).boot;
       const faultStarted = Date.now();
       await invokeFault(id, command, faultAt);
-      const reattached = expectStatus(await request("/api/probe", { id, command }), 200, `reattach ${faultAt}`);
+      const reattachment = await collectProbeToExit(id, command, `reattach ${faultAt}`);
+      const reattached = reattachment.result;
       const after = await state();
       const effects = await markerCount(path, marker);
-      assert.equal(reattached.state, "exited");
       assert.equal(effects, 1);
       assert.equal(after.boot, bootBefore);
       record(`fault-${faultAt}`, {
         pass: true, iteration: i + 1, commandId: reattached.commandId,
+        classificationProgression: reattachment.classifications,
         classification: reattached.state, effects,
         bootIdBefore: bootBefore, bootIdAfter: after.boot,
         recoveryDurationMs: Date.now() - faultStarted
@@ -609,7 +633,8 @@ try {
       bootIdAtDeployStart: active.boot
     });
     await initialRequest;
-    const reattached = expectStatus(await request("/api/probe", { id, command }), 200, "observe command after redeploy");
+    const reattachment = await reobserveProbeToTerminal(id, command, "observe command after redeploy");
+    const reattached = reattachment.result;
     const after = await state();
     const effects = await markerCount("redeploy.txt", marker);
     assert.ok(["exited", "lost"].includes(reattached.state), "redeployed command is collected or conservatively classified");
@@ -625,6 +650,7 @@ try {
     record("redeploy-command-recovery", {
       pass: true, commandId: reattached.commandId, classification: reattached.state,
       effects, bootIdBefore: before.boot, bootIdAfter: after.boot,
+      classificationProgression: reattachment.classifications,
       recoveryDurationMs: Date.now() - deployStartedAt
     });
   }
@@ -644,7 +670,8 @@ try {
     );
     await expectStatus(await request("/api/destroy", {}), 200, "replace active command container");
     await initialRequest;
-    const lost = expectStatus(await request("/api/probe", { id, command }), 200, "classify replaced command");
+    const lostObservation = await reobserveProbeToTerminal(id, command, "classify replaced command");
+    const lost = lostObservation.result;
     assert.equal(lost.state, "lost");
     assert.equal(await markerCount(path, marker), 0);
     const after = await state();
@@ -661,6 +688,7 @@ try {
     record("container-replacement-active", {
       pass: true, iteration: i + 1, commandId: lost.commandId,
       classification: lost.state, effects: 0, processStateBeforeReplacement: running.processObservation?.kind,
+      classificationProgression: lostObservation.classifications,
       bootIdBefore: before.boot, bootIdAfter: after.boot,
       otherMutationBlocked: true, recoveryDurationMs: Date.now() - recoveryStarted
     });
@@ -676,13 +704,15 @@ try {
     const blocked = await request("/api/probe", { id: `late-blocked-${testId}`, command: appendCommand("late-blocked", "late-blocked.txt") });
     assert.equal(blocked.status, 409);
     await sleep(7000);
-    const lateResult = expectStatus(await request("/api/probe", { id, command }), 200, "collect late result");
+    const lateObservation = await collectProbeToExit(id, command, "collect late result");
+    const lateResult = lateObservation.result;
     assert.equal(lateResult.state, "exited");
     const effects = await markerCount("late.txt", marker);
     assert.equal(effects, 1);
     record("late-completion-after-deadline", {
       pass: true, commandId: lateResult.commandId, classification: lateResult.state,
-      initialClassification: timedOut.state, effects, recoveryDurationMs: Date.now() - started
+      initialClassification: timedOut.state, effects, recoveryDurationMs: Date.now() - started,
+      reattachmentClassifications: lateObservation.classifications
     });
   }
 
