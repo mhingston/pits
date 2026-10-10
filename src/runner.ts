@@ -1,5 +1,5 @@
 import { DirectoryBackup, type DirectoryBackupRecord, type DirectoryBackupGatewayBinding } from "@cloudflare/sandbox";
-import { decide } from "./recovery.mjs";
+import { decide, observationGate, forbidUncertainRedispatch } from "./recovery.mjs";
 import { RUN, STATUS } from "./process-protocol.mjs";
 
 const ROOT = "/var/lib/pits-processes";
@@ -138,9 +138,13 @@ export class SandboxRunner {
     // of that exact task may observe its *existing* process and collect an
     // eventual exit receipt, but cannot launch a second command.
     // Workspace loss or an unacknowledged restore always blocks execution.
-    if (await this.storage.get<boolean>("restore-required") ||
-        await this.storage.get<boolean>("reconciliation-required")) {
-      throw new Error("Workspace restore and human reconciliation required before executing another command");
+    if (observationGate({
+      active: await this.storage.get<string>("active"),
+      requested: id,
+      restoreRequired: (await this.storage.get<boolean>("restore-required")) ?? false,
+      reconciliationRequired: (await this.storage.get<boolean>("reconciliation-required")) ?? false
+    }) === "blocked") {
+      throw new Error("Workspace unavailable or another command is active; recovery required");
     }
 
     // Stage 0 does not support detached/background processes. This rejects
@@ -168,15 +172,12 @@ export class SandboxRunner {
     });
 
     const observation = await this.status(id);
-    const action = decide(intent, bootId, observation.kind);
+    const action = forbidUncertainRedispatch(
+      decide(intent, bootId, observation.kind),
+      (await this.storage.get<boolean>("no-redispatch:" + id)) ?? false
+    );
     if (action === "lost" || action === "unknown") {
-      return this.ambiguous(id, action, "Process state cannot be proven");
-    }
-    // Once an invocation has returned unknown, never redispatch it even
-    // if its same-boot reservation becomes missing. Only read/reconcile
-    // the already-started process.
-    if (action === "dispatch" && await this.storage.get<boolean>("no-redispatch:" + id)) {
-      return this.ambiguous(id, "unknown", "Cannot prove dispatch never happened; retry forbidden");
+      return this.ambiguous(id, action, "Process state cannot be proven; never redispatch after uncertainty");
     }
     if (action === "dispatch") {
       await this.sh(["mkdir", "-p", ROOT]);
