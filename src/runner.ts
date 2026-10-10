@@ -134,6 +134,10 @@ export class SandboxRunner {
       await this.storage.put("restore-required", true);
       return { state: "lost", commandId: id, reason: "Container boot changed; restore and reconcile" };
     }
+    // An unknown or timed-out command retains the 'active' lock. A retry
+    // of that exact task may observe its *existing* process and collect an
+    // eventual exit receipt, but cannot launch a second command.
+    // Workspace loss or an unacknowledged restore always blocks execution.
     if (await this.storage.get<boolean>("restore-required") ||
         await this.storage.get<boolean>("reconciliation-required")) {
       throw new Error("Workspace restore and human reconciliation required before executing another command");
@@ -168,6 +172,12 @@ export class SandboxRunner {
     if (action === "lost" || action === "unknown") {
       return this.ambiguous(id, action, "Process state cannot be proven");
     }
+    // Once an invocation has returned unknown, never redispatch it even
+    // if its same-boot reservation becomes missing. Only read/reconcile
+    // the already-started process.
+    if (action === "dispatch" && await this.storage.get<boolean>("no-redispatch:" + id)) {
+      return this.ambiguous(id, "unknown", "Cannot prove dispatch never happened; retry forbidden");
+    }
     if (action === "dispatch") {
       await this.sh(["mkdir", "-p", ROOT]);
       const reserved = await this.sh(["mkdir", ROOT + "/" + id]);
@@ -198,6 +208,7 @@ export class SandboxRunner {
           result.sequence = sequence;
           await tx.put("command-sequence", sequence);
           await tx.put("receipt:" + id, result);
+          await tx.delete("no-redispatch:" + id);
           await tx.put("last-command", id);
           if (await tx.get<string>("active") === id) await tx.delete("active");
         });
@@ -214,8 +225,11 @@ export class SandboxRunner {
   }
 
   private async ambiguous(id: string, state: "unknown" | "lost", reason: string): Promise<Result> {
-    // Fail closed. Never delete the active intent on ambiguity.
-    await this.storage.put("restore-required", true);
+    // Fail closed. Keep the active lock and a durable no-dispatch marker.
+    // Another request for this *same* task may poll and collect a late exit,
+    // which releases the lock atomically with its receipt. Unlike a lost
+    // container boot, an observation timeout is not workspace loss.
+    await this.storage.put("no-redispatch:" + id, true);
     return { commandId: id, state, reason };
   }
 
