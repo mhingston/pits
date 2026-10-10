@@ -444,12 +444,18 @@ export class SandboxRunner {
   async inspect() {
     const boot = await this.storage.get<string>("boot");
     const active = await this.storage.get<string>("active");
+    // Inspection may overlap a container start/stop or replacement. A failed
+    // observation is diagnostic uncertainty, not a reason to fail the whole
+    // state request (and never evidence that the command is safe to replay).
+    const processObservation = active
+      ? await this.status(active).catch(() => ({ kind: "unknown" as const }))
+      : null;
     return {
       boot,
       containerRunning: this.container.running,
       active,
       activeIntent: active ? await this.storage.get<Intent>("intent:" + active) : null,
-      processObservation: active ? await this.status(active) : null,
+      processObservation,
       backupInterruptionFiredAt: await this.storage.get<number>("test-backup-interruption-fired-at") ?? null,
       restoreRequired: (await this.storage.get<boolean>("restore-required")) ?? false,
       reconciliationRequired: (await this.storage.get<boolean>("reconciliation-required")) ?? false,
