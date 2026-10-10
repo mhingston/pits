@@ -131,8 +131,15 @@ export class SandboxRunner {
     throw new Error("Unrecognised process state: " + stdout);
   }
 
-  private injectFault(requested: FaultStage | undefined, stage: FaultStage): void {
-    if (requested === stage) this.ctx.abort("pits fault injection: " + stage, { retryAlarm: false });
+  private async injectFault(requested: FaultStage | undefined, stage: FaultStage): Promise<void> {
+    if (requested !== stage) return;
+
+    this.ctx.abort("pits fault injection: " + stage, { retryAlarm: false });
+    // abort() initiates a reset, but returning through fast, already-resolved
+    // container/storage calls can otherwise let the request complete before
+    // the runtime tears this instance down. Keep this invocation suspended so
+    // the injected crash is deterministic at the requested boundary.
+    await new Promise<void>(() => {});
   }
 
   async execute(taskId: string, command: string, faultAt?: FaultStage): Promise<Result> {
@@ -185,7 +192,7 @@ export class SandboxRunner {
 
     // Persistent single-writer gate shared with workspace checkpointing.
     // The Pi tool additionally requests executionMode: sequential.
-    this.injectFault(faultAt, "before_intent");
+    await this.injectFault(faultAt, "before_intent");
     await this.storage.transaction(async tx => {
       if (await tx.get<boolean>("maintenance")) throw new Error("Workspace maintenance in progress");
       const active = await tx.get<string>("active");
@@ -203,7 +210,7 @@ export class SandboxRunner {
       await tx.put("active", id);
     });
     if (!intent) throw new Error("Durable command intent was not established");
-    this.injectFault(faultAt, "after_intent");
+    await this.injectFault(faultAt, "after_intent");
 
     let observation: Awaited<ReturnType<SandboxRunner["status"]>>;
     try {
@@ -224,7 +231,7 @@ export class SandboxRunner {
       if (reserved.exitCode === 0) {
         // The DO intent was stored BEFORE the container's atomic mkdir.
         // A crash after mkdir but before exec is UNKNOWN, not a retry.
-        this.injectFault(faultAt, "after_reservation");
+        await this.injectFault(faultAt, "after_reservation");
         try {
           await this.container.exec(
             ["sh", "-c", RUN, "sh", ROOT + "/" + id, "sh", "-lc", command],
@@ -235,7 +242,7 @@ export class SandboxRunner {
           // the process. Keep the reservation and never issue a second launch.
           return this.observationFailure(id, intent, "Process launch acknowledgement was lost");
         }
-        this.injectFault(faultAt, "after_launch");
+        await this.injectFault(faultAt, "after_launch");
       }
       // If mkdir lost a concurrent race, follow the winner.
     }
@@ -248,7 +255,7 @@ export class SandboxRunner {
         return this.observationFailure(id, intent, "Process state could not be observed after dispatch");
       }
       if (now.kind === "exited") {
-        this.injectFault(faultAt, "after_exit_before_receipt");
+        await this.injectFault(faultAt, "after_exit_before_receipt");
         const stdout = await this.sh(["sh", "-c", 'tail -c 32768 "$1/stdout.log"', "sh", ROOT + "/" + id]);
         const stderr = await this.sh(["sh", "-c", 'tail -c 32768 "$1/stderr.log"', "sh", ROOT + "/" + id]);
         const result: Result = {
@@ -266,7 +273,7 @@ export class SandboxRunner {
           await tx.put("last-command", id);
           if (await tx.get<string>("active") === id) await tx.delete("active");
         });
-        this.injectFault(faultAt, "after_receipt");
+        await this.injectFault(faultAt, "after_receipt");
         return result;
       }
       if (now.kind === "lost") return this.ambiguous(id, "unknown", "Launcher ended without exit receipt");
@@ -359,7 +366,7 @@ export class SandboxRunner {
         throw new Error("DO interruption did not terminate the active backup");
       }
       const backup = await backupPromise;
-      this.injectFault(faultAt, "after_backup_before_checkpoint");
+      await this.injectFault(faultAt, "after_backup_before_checkpoint");
       const point: Checkpoint = {
         backup, bootId,
         commandId: await this.storage.get<string>("last-command") ?? null,

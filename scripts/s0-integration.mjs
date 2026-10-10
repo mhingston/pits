@@ -12,6 +12,7 @@ const accessCookie = process.env.PITS_ACCESS_COOKIE;
 const workerName = process.env.PITS_WORKER_NAME ?? "pits-s0-test-recovery";
 const predeployed = process.env.PITS_TEST_PREDEPLOYED === "true";
 const iterations = Number(process.env.PITS_ITERATIONS ?? 10);
+const onlyFaultStage = process.env.PITS_TEST_ONLY_FAULT_STAGE;
 const testId = process.env.PITS_TEST_ID ??
   `${new Date().toISOString().replace(/[^0-9]/g, "").slice(0, 14)}-${randomBytes(4).toString("hex")}`;
 const artifactPath = resolve(process.env.PITS_EVIDENCE ?? `artifacts/s0-${testId}.jsonl`);
@@ -20,6 +21,8 @@ const logsPath = resolve(process.env.PITS_CLOUDFLARE_LOGS ?? `artifacts/s0-${tes
 assert.ok(baseUrl, "Set PITS_URL to the disposable Cloudflare Worker URL");
 assert.ok(token && token.length >= 32, "Set PITS_API_TOKEN to the locally held test secret (at least 32 characters)");
 assert.ok(Number.isInteger(iterations) && iterations >= 10 && iterations <= 100, "PITS_ITERATIONS must be 10..100");
+assert.ok(onlyFaultStage === undefined || onlyFaultStage === "after_exit_before_receipt",
+  "PITS_TEST_ONLY_FAULT_STAGE currently supports after_exit_before_receipt only");
 const base = new URL(baseUrl);
 assert.equal(base.protocol, "https:", "Live integration tests require HTTPS");
 assert.ok(!["localhost", "127.0.0.1", "::1"].includes(base.hostname), "Local emulation is not live Cloudflare evidence");
@@ -233,7 +236,8 @@ async function stopCloudflareLogs() {
 
 async function invokeFault(id, command, faultAt) {
   const response = await request("/api/probe", { id, command, faultAt });
-  assert.notEqual(response.status, 200, `${faultAt}: injected DO abort unexpectedly returned a normal response`);
+  assert.notEqual(response.status, 200,
+    `${faultAt}: injected DO abort unexpectedly returned HTTP ${response.status}; body=${JSON.stringify(response.body)}`);
   return response;
 }
 
@@ -303,6 +307,28 @@ try {
   record("test-routing-ready", {
     pass: true, objectName: routing.objectName, propagationWaitMs: Date.now() - routingStartedAt
   });
+  if (onlyFaultStage) {
+    for (let i = 0; i < iterations; i++) {
+      const id = `exit-before-receipt-${testId}-${i}`;
+      const marker = `exit-before-receipt-${testId}-${i}`;
+      const path = `exit-before-receipt-${i}.txt`;
+      const command = appendCommand(marker, path);
+      const fault = await invokeFault(id, command, onlyFaultStage);
+      const bootAfterFault = (await state()).boot;
+      const recovered = await collectProbeToExit(id, command, `focused ${onlyFaultStage} recovery`);
+      const effects = await markerCount(path, marker);
+      const after = await state();
+      assert.equal(effects, 1, "recovered result corresponds to exactly one filesystem effect");
+      assert.ok(bootAfterFault, "fault injection starts the execution container before process exit");
+      assert.equal(after.boot, bootAfterFault, "same-boot exit recovery does not replace the container");
+      record(`fault-${onlyFaultStage}`, {
+        pass: true, iteration: i + 1, commandId: recovered.result.commandId,
+        faultResponseStatus: fault.status, classificationProgression: recovered.classifications,
+        classification: recovered.result.state, effects, bootIdBefore: bootAfterFault,
+        bootIdAfter: after.boot, recoveryDurationMs: recovered.recoveryDurationMs
+      });
+    }
+  } else {
   const health = expectStatus(await request("/health", undefined, { auth: false }), 200, "health");
   assert.equal(health.service, "pits-s0");
   assert.equal((await request("/api/state", undefined, { auth: false })).status, 401, "API rejects missing bearer token");
@@ -832,6 +858,7 @@ try {
     postRestoreEffectPresent: false, reconciliationGateBlocked: true,
     transcriptEntryKinds: afterRebasedRestore.pi.activeEntryKinds
   });
+  }
 } catch (error) {
   outcome = "failed";
   record("suite-failure", { pass: false, error: error instanceof Error ? redact(error.message) : "unknown error" });
