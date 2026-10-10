@@ -341,7 +341,7 @@ try {
     const correctRouting = response.status === 200 && response.body.workerFaultsEnabled === true &&
       response.body.workerFixtureEnabled === true && response.body.objectName === `test-${testId}` &&
       response.body.requestedTestId === testId && response.body.workerSourceRevision === sourceCommit &&
-      response.body.checkpointProtocol === "owner-retention-git-generation-v4";
+      response.body.checkpointProtocol === "owner-retention-git-generation-v5";
     if (correctRouting && !testModeEnabled) {
       const enabledMode = await request("/api/test/enable", {});
       if (enabledMode.status === 200 && enabledMode.body.faultsEnabled === true &&
