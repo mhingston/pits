@@ -74,6 +74,17 @@ async function state() {
   return expectStatus(await request("/api/state"), 200, "state");
 }
 
+async function waitForState(predicate, label, timeoutMs = 45_000) {
+  const started = Date.now();
+  let last;
+  while (Date.now() - started < timeoutMs) {
+    last = await state();
+    if (predicate(last)) return last;
+    await sleep(500);
+  }
+  throw new Error(`Timed out waiting for ${label}; last state: ${JSON.stringify(last)}`);
+}
+
 async function evidence(path) {
   const response = await request(`/api/evidence?path=${encodeURIComponent(path)}`);
   if (response.status === 409 || response.status === 404) return undefined;
@@ -223,10 +234,10 @@ try {
   // Drive an actual pi-durable task with a zero-cost deterministic pi-ai provider.
   const fixtureMarker = `pi-${testId}`;
   const fixturePending = request("/api/ask-fixture", { marker: fixtureMarker });
-  await sleep(1500);
-  const duringFixture = await state();
-  assert.ok(duringFixture.pi.pendingCount > 0, "PiHarness reports a pending durable operation");
-  assert.ok(duringFixture.pi.lifecycleAlarm !== null, "Lifecycle scheduled the shared DO alarm");
+  const duringFixture = await waitForState(
+    value => value.pi.pendingCount > 0 && value.pi.lifecycleAlarm !== null,
+    "PiHarness pending operation and Lifecycle alarm"
+  );
   const fixtureBoot = duringFixture.boot;
   const abortedFixture = await request("/api/abort", {});
   assert.notEqual(abortedFixture.status, 200, "test abort resets the DO instance");
@@ -276,9 +287,7 @@ try {
     const marker = `replace-${testId}`;
     const before = await state();
     const initialAsk = request("/api/ask-fixture", { marker });
-    await sleep(1500);
-    const active = await state();
-    assert.ok(active.activeIntent, "Pi fixture started its sandbox command");
+    const active = await waitForState(value => Boolean(value.activeIntent), "Pi fixture sandbox command");
     await expectStatus(await request("/api/destroy", {}), 200, "replace container during Pi command");
     const initialResult = expectStatus(await initialAsk, 200, "settle Pi command after replacement");
     const recovered = expectStatus(await request("/api/ask-fixture", { marker }), 200, "reattach Pi operation after replacement");
@@ -407,9 +416,8 @@ try {
     const command = `sleep 60 && ${appendCommand(marker, "do-restart.txt")}`;
     const before = await state();
     const initialRequest = request("/api/probe", { id, command });
-    await sleep(1200);
-    const running = await state();
-    assert.equal(running.activeIntent?.id, `p${sha256(`task:probe:${id}`).slice(0, 32)}`);
+    const expectedCommandId = `p${sha256(`task:probe:${id}`).slice(0, 32)}`;
+    const running = await waitForState(value => value.activeIntent?.id === expectedCommandId, "60-second command intent");
     assert.equal(running.boot, before.boot);
     const checkpointDuringRun = await request("/api/checkpoint", {});
     assert.equal(checkpointDuringRun.status, 409, "checkpoint is blocked while command is active");
@@ -469,9 +477,8 @@ try {
     const command = `sleep 65 && ${appendCommand(marker, "redeploy.txt")}`;
     const before = await state();
     const initialRequest = request("/api/probe", { id, command });
-    await sleep(1200);
-    const active = await state();
-    assert.equal(active.activeIntent?.id, `p${sha256(`task:probe:${id}`).slice(0, 32)}`);
+    const expectedCommandId = `p${sha256(`task:probe:${id}`).slice(0, 32)}`;
+    const active = await waitForState(value => value.activeIntent?.id === expectedCommandId, "redeploy test command intent");
     const deployStartedAt = Date.now();
     const deployment = await deployTestWorker(true, true);
     assert.equal(deployment.code, 0, `test Worker redeployment failed: ${deployment.output}`);
@@ -508,7 +515,7 @@ try {
     const command = `sleep 15 && ${appendCommand(marker, "replace.txt")}`;
     const before = await state();
     const initialRequest = request("/api/probe", { id, command });
-    await sleep(1200);
+    await waitForState(value => Boolean(value.activeIntent), "container replacement command intent");
     await expectStatus(await request("/api/destroy", {}), 200, "replace active command container");
     await initialRequest;
     const lost = expectStatus(await request("/api/probe", { id, command }), 200, "classify replaced command");
