@@ -77,6 +77,15 @@ async function request(path, body, { auth = true, timeoutMs = 190_000 } = {}) {
     const text = await response.text();
     let parsed;
     try { parsed = JSON.parse(text); } catch { parsed = { text: redact(text).slice(0, 1000) }; }
+    const safeReattachment = body === undefined ||
+      (path === "/api/probe" && typeof body?.id === "string" && body.faultAt === undefined);
+    if (response.status === 409 && safeReattachment && typeof parsed?.error === "string" &&
+        parsed.error.startsWith("Connection closed: this Durable Object instance is no longer active.")) {
+      if (timeoutMs <= 1000) return { status: response.status, body: parsed };
+      record("transport-reattachment", { path, probeId: body?.id ?? null });
+      await sleep(1000);
+      return request(path, body, { auth, timeoutMs: Math.min(timeoutMs - 1000, 30_000) });
+    }
     if (response.status === 409 && parsed?.error === "Test deployment revision has not converged") {
       if (timeoutMs <= 1000) return { status: response.status, body: parsed };
       await sleep(1000);
