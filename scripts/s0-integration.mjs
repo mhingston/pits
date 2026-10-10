@@ -387,8 +387,16 @@ try {
       const before = await state();
       const fault = await invokeCheckpointFault(onlyCheckpointFault);
       const after = await state();
+      record("backup-fault-observation", {
+        pass: after.backupInterruptionFiredAt !== null && after.backupInterruptionPartUploaded === true,
+        iteration: i + 1, responseStatus: fault.status,
+        responseError: typeof fault.body?.error === "string" ? redact(fault.body.error).slice(0, 300) : null,
+        backupInterruptionFiredAt: after.backupInterruptionFiredAt,
+        backupInterruptionPartUploaded: after.backupInterruptionPartUploaded,
+        checkpointId: after.checkpoint?.backup?.id ?? null
+      });
       assert.notEqual(after.backupInterruptionFiredAt, null,
-        "controlled interruption fired while the DirectoryBackup transfer was in flight");
+        `controlled interruption fired while the DirectoryBackup transfer was in flight; response=${fault.status} ${JSON.stringify(fault.body)}`);
       assert.ok(after.backupInterruptionFiredAt > (before.backupInterruptionFiredAt ?? 0),
         "each backup interruption is independently observed");
       assert.equal(after.backupInterruptionPartUploaded, true,
@@ -988,12 +996,20 @@ try {
       }
       if (stableWorkerDisabledSamples === 3) {
         const finalMode = await request("/api/test/disable", {});
-        const finalStatus = await request("/api/test/status");
-        verification = finalMode.status === 200 && finalMode.body.faultsEnabled === false &&
-          finalMode.body.fixtureEnabled === false && finalStatus.status === 200 &&
-          finalStatus.body.faultsEnabled === false && finalStatus.body.fixtureEnabled === false &&
-          finalStatus.body.workerFaultsEnabled === false && finalStatus.body.workerFixtureEnabled === false &&
-          finalStatus.body.objectName === `test-${testId}` && finalStatus.body.requestedTestId === testId;
+        let stableFullyDisabledSamples = 0;
+        const finalVerificationStartedAt = Date.now();
+        while (finalMode.status === 200 && Date.now() - finalVerificationStartedAt < 30_000 &&
+            stableFullyDisabledSamples < 3) {
+          const finalStatus = await request("/api/test/status");
+          const fullyDisabled = finalStatus.status === 200 && finalStatus.body.faultsEnabled === false &&
+            finalStatus.body.fixtureEnabled === false && finalStatus.body.workerFaultsEnabled === false &&
+            finalStatus.body.workerFixtureEnabled === false && finalStatus.body.objectName === `test-${testId}` &&
+            finalStatus.body.requestedTestId === testId;
+          stableFullyDisabledSamples = fullyDisabled ? stableFullyDisabledSamples + 1 : 0;
+          if (stableFullyDisabledSamples < 3) await sleep(500);
+        }
+        verification = stableFullyDisabledSamples === 3 && finalMode.body.faultsEnabled === false &&
+          finalMode.body.fixtureEnabled === false;
       }
     }
     const pass = disabled.code === 0 && doModeDisabled && verification === true;
