@@ -758,6 +758,8 @@ try {
     assert.equal(running.boot, before.boot);
     const checkpointDuringRun = await request("/api/checkpoint", {});
     assert.equal(checkpointDuringRun.status, 409, "checkpoint is blocked while command is active");
+    const collectDuringRun = await request("/api/backups/collect", {});
+    assert.equal(collectDuringRun.status, 409, "backup collection is blocked while command is active");
     const competing = await request("/api/probe", {
       id: `competing-${testId}`, command: appendCommand(`competing-${testId}`, "competing.txt")
     });

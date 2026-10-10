@@ -505,7 +505,7 @@ export class SandboxRunner {
     if (repository.exitCode !== 0) return { head: null, tree: null, status: "not-a-repository" };
     const head = await this.sh(["git", "rev-parse", "--verify", "HEAD"], WORKSPACE);
     const tree = await this.sh(["git", "rev-parse", "--verify", "HEAD^{tree}"], WORKSPACE);
-    const status = await this.sh(["git", "status", "--porcelain=v1", "--untracked-files=all"], WORKSPACE);
+    const status = await this.sh(["git", "status", "--porcelain=v1", "--untracked-files=all", "--", ".", ":(exclude)node_modules/", ":(exclude).cache/"], WORKSPACE);
     if (status.exitCode !== 0) throw new Error("Cannot capture checkpoint Git status");
     return { head: head.exitCode === 0 ? head.stdout.trim() : null,
       tree: tree.exitCode === 0 ? tree.stdout.trim() : null, status: status.stdout };
@@ -552,7 +552,7 @@ export class SandboxRunner {
           printf excluded > node_modules/excluded.txt
           printf excluded > .cache/excluded.txt
           git init -q
-          git add .
+          git add . ":(exclude)node_modules/" ":(exclude).cache/"
           git -c user.name=S0 -c user.email=s0@example.invalid commit -qm repository-fixture
           printf '\nS0 dirty tracked fixture\n' >> README.md
           printf 'untracked fixture\n' > untracked-fixture.txt
