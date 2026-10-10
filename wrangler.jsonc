@@ -1,0 +1,19 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "pits-s0",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-09",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": {
+    "bindings": [{ "name": "PITS", "class_name": "PitsAgent" }]
+  },
+  "containers": [{
+    "class_name": "PitsAgent",
+    "scheduling_policy": "durable_object",
+    "images": { "sandbox": { "dockerfile": "./Dockerfile" } }
+  }],
+  "exports": { "PitsAgent": { "type": "durable-object", "storage": "sqlite" } },
+  "r2_buckets": [{ "binding": "BACKUPS", "bucket_name": "pits-s0-backups" }],
+  "ai": { "binding": "AI", "remote": true },
+  "observability": { "enabled": true }
+}

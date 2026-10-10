@@ -1,0 +1,23 @@
+{
+  "name": "pits",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test tests/*.test.mjs",
+    "test:integration": "node scripts/s0-integration.mjs"
+  },
+  "dependencies": {
+    "@cloudflare/sandbox": "1.0.0",
+    "@earendil-works/pi-ai": "1.0.0",
+    "@earendil-works/pi-durable": "1.0.0",
+    "agents": "0.28.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20261008.1",
+    "typescript": "6.0.3",
+    "wrangler": "4.149.0"
+  }
+}

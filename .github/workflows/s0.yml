@@ -1,0 +1,28 @@
+name: S0 checks
+on:
+  push:
+    branches: [feat/s0-durable-sandbox-spike]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Generate Cloudflare types
+        run: npx wrangler types
+      - name: Unit and shell protocol tests
+        run: npm test
+      - name: TypeScript
+        run: npm run typecheck
