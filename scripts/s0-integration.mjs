@@ -173,8 +173,13 @@ function startCloudflareLogs() {
   logChild.on("error", () => { logStatus = "failed-to-start"; });
 }
 
-function deployTestWorker(faults, fixture) {
-  return new Promise(resolve => {
+const RETRYABLE_CONTAINER_SETTINGS_ERROR =
+  "could not finish applying its Durable Object-managed Container application settings";
+
+async function deployTestWorker(faults, fixture) {
+  let last;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    last = await new Promise(resolve => {
     const env = { ...process.env };
     delete env.PITS_API_TOKEN;
     delete env.PITS_ACCESS_COOKIE;
@@ -205,7 +210,14 @@ function deployTestWorker(faults, fixture) {
       clearTimeout(timeout);
       resolve({ code, timedOut, output: output.slice(-4000) });
     });
-  });
+    });
+    last.attempts = attempt;
+    if (last.code === 0 || !last.output.includes(RETRYABLE_CONTAINER_SETTINGS_ERROR) || attempt === 3) {
+      return last;
+    }
+    await sleep(1_000);
+  }
+  return last;
 }
 
 async function stopCloudflareLogs() {
@@ -267,6 +279,7 @@ try {
     `could not enable isolated test switches: ${"output" in enabled ? enabled.output : "predeployment was not verified"}`);
   record("test-switches-enabled", {
     pass: true, worker: workerName, deploymentExitCode: enabled.code,
+    deploymentAttempts: enabled.attempts ?? 1,
     mode: predeployed ? "predeployed-and-verified-below" : "deployed-by-harness"
   });
   startCloudflareLogs();
@@ -845,6 +858,7 @@ try {
     const pass = disabled.code === 0 && doModeDisabled && verification === true;
     record("fault-injection-disabled", {
       pass, deploymentExitCode: disabled.code, timedOut: disabled.timedOut,
+      deploymentAttempts: disabled.attempts ?? 1,
       durableModeVerifiedDisabled: doModeDisabled,
       postDeploySwitchesVerifiedDisabled: verification === true,
       output: disabled.output
