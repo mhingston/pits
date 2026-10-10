@@ -589,7 +589,8 @@ try {
   // IDs so each interruption exercises its own reservation and receipt.
   for (const faultAt of ["after_launch", "after_exit_before_receipt", "after_receipt"]) {
     for (let i = 0; i < iterations; i++) {
-      const id = `${faultAt}-${testId}-${i}`, marker = `${faultAt}-${testId}-${i}`;
+      const id = `${faultAt.replaceAll("_", "-")}-${testId}-${i}`;
+      const marker = `${faultAt}-${testId}-${i}`;
       const path = `${faultAt}-${i}.txt`;
       const command = faultAt === "after_launch"
         ? `sleep 3 && ${appendCommand(marker, path)}`
