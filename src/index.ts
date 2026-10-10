@@ -283,16 +283,22 @@ export default {
     const testId = request.headers.get("X-PITS-Test-ID");
     const testControlRequest = pathname === "/api/test/status" || pathname === "/api/test/disable";
     let objectName = "s0";
-    if ((env.PITS_ENABLE_FAULTS === "true" && env.PITS_ENABLE_FIXTURE === "true") || testControlRequest) {
+    const validTestId = testId !== null && /^[a-z0-9-]{1,63}$/.test(testId);
+    if (validTestId) {
+      // Keep every request in one run on the same isolated DO even while
+      // Worker environment changes are propagating between versions.
+      objectName = "test-" + testId;
+    } else if ((env.PITS_ENABLE_FAULTS === "true" && env.PITS_ENABLE_FIXTURE === "true") || testControlRequest) {
       if (!testId || !/^[a-z0-9-]{1,63}$/.test(testId)) {
         return new Response("Missing or invalid test object ID", { status: 400 });
       }
-      // Reuse one isolated Worker/Container application while giving each
-      // destructive integration run a clean Durable Object identity.
-      objectName = "test-" + testId;
     }
     const agent = env.PITS.getByName(objectName);
     try {
+      if (objectName !== "s0" && !testControlRequest) {
+        const mode = await agent.testStatus({ faultsEnabled: false, fixtureEnabled: false });
+        if (!mode.faultsEnabled && !mode.fixtureEnabled) return new Response("Not found", { status: 404 });
+      }
       if (pathname === "/api/test/status" && request.method === "GET") {
         const durableObject = await agent.testStatus({
           faultsEnabled: env.PITS_ENABLE_FAULTS === "true",
@@ -315,7 +321,11 @@ export default {
         return Response.json(await agent.readEvidence(path));
       }
       if (pathname === "/api/state" && request.method === "GET") {
-        return Response.json(await agent.inspect());
+        return Response.json({
+          ...await agent.inspect(),
+          objectName,
+          requestedTestId: testId
+        });
       }
       if (request.method !== "POST") return new Response("Not found", { status: 404 });
       if (pathname === "/api/probe") {
@@ -357,16 +367,22 @@ export default {
         }
         return Response.json(await agent.ask(body.prompt));
       }
-      if (pathname === "/api/ask-fixture" && env.PITS_ENABLE_FIXTURE === "true") {
+      if (pathname === "/api/ask-fixture") {
+        const mode = await agent.testStatus({ faultsEnabled: false, fixtureEnabled: false });
+        if (!mode.fixtureEnabled) return new Response("Not found", { status: 404 });
         const body = await request.json() as { marker?: unknown };
         if (typeof body.marker !== "string") return new Response("Expected marker string", { status: 400 });
         return Response.json(await agent.askFixture(body.marker));
       }
-      if (pathname === "/api/destroy" && env.PITS_ENABLE_FAULTS === "true") {
+      if (pathname === "/api/destroy") {
+        const mode = await agent.testStatus({ faultsEnabled: false, fixtureEnabled: false });
+        if (!mode.faultsEnabled) return new Response("Not found", { status: 404 });
         await agent.destroyForTest();
         return Response.json({ destroyed: true });
       }
-      if (pathname === "/api/abort" && env.PITS_ENABLE_FAULTS === "true") {
+      if (pathname === "/api/abort") {
+        const mode = await agent.testStatus({ faultsEnabled: false, fixtureEnabled: false });
+        if (!mode.faultsEnabled) return new Response("Not found", { status: 404 });
         await agent.abortForTest();
         return Response.json({ aborted: true });
       }

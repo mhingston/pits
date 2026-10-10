@@ -83,7 +83,28 @@ function expectStatus(response, status, scenario) {
 }
 
 async function state() {
-  return expectStatus(await request("/api/state"), 200, "state");
+  const started = Date.now();
+  let last;
+  while (Date.now() - started < 30_000) {
+    const response = await request("/api/state");
+    last = { status: response.status, body: response.body };
+    if (response.status === 409 &&
+        response.body?.error === "exec() cannot be called on a container that is not running.") {
+      // A stale Worker version or a container transition may make this
+      // read-only diagnostic temporarily unavailable. Keep polling; do not
+      // reinterpret the failed observation as permission to replay anything.
+      await sleep(250);
+      continue;
+    }
+    if (response.status === 200 && response.body?.objectName !== `test-${testId}`) {
+      await sleep(250);
+      continue;
+    }
+    const body = expectStatus(response, 200, "state");
+    assert.equal(body.requestedTestId, testId, "state request remains on this test's isolated Durable Object");
+    return body;
+  }
+  throw new Error(`state: test DO was not observable within 30 seconds; last=${JSON.stringify(last)}`);
 }
 
 async function waitForState(predicate, label, timeoutMs = 45_000) {
@@ -290,6 +311,7 @@ try {
   const routingStartedAt = Date.now();
   let routing;
   let lastRoutingResponse;
+  let stableRoutingSamples = 0;
   while (Date.now() - routingStartedAt < 120_000) {
     const response = await request("/api/test/status");
     lastRoutingResponse = { status: response.status, body: response.body };
@@ -297,15 +319,21 @@ try {
       response.body.fixtureEnabled === true && response.body.workerFaultsEnabled === true &&
       response.body.workerFixtureEnabled === true && response.body.objectName === `test-${testId}` &&
       response.body.requestedTestId === testId) {
-      routing = response.body;
-      break;
+      stableRoutingSamples++;
+      if (stableRoutingSamples >= 5) {
+        routing = response.body;
+        break;
+      }
+    } else {
+      stableRoutingSamples = 0;
     }
     await sleep(1_000);
   }
   assert.ok(routing,
     `test Worker deployment did not become active with the requested Durable Object routing; last=${JSON.stringify(lastRoutingResponse)}`);
   record("test-routing-ready", {
-    pass: true, objectName: routing.objectName, propagationWaitMs: Date.now() - routingStartedAt
+    pass: true, objectName: routing.objectName,
+    stableSamples: stableRoutingSamples, propagationWaitMs: Date.now() - routingStartedAt
   });
   if (onlyFaultStage) {
     for (let i = 0; i < iterations; i++) {
