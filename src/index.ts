@@ -1,3 +1,4 @@
+import { timingSafeEqual } from "node:crypto";
 import { DurableObject } from "cloudflare:workers";
 import { Type, fauxAssistantMessage, fauxProvider, fauxToolCall, type TranscriptContext } from "@earendil-works/pi-ai";
 import { createModels } from "@earendil-works/pi-ai/models";
@@ -10,12 +11,10 @@ import { SandboxRunner } from "./runner";
 import type { FaultStage } from "./runner";
 import { loadTestMode, storeTestMode, type TestMode } from "./test-mode.mjs";
 
-const CHECKPOINT_PROTOCOL = "owner-retention-git-generation-v4";
+const CHECKPOINT_PROTOCOL = "owner-retention-git-generation-v5";
 const FIXTURE_PROMPT = /^pits-fixture:([a-z0-9-]{1,63})$/;
 const PI_REOBSERVE_DEADLINE_MS = 4 * 60_000;
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-const BACKUP_FAULT_ARM_KEY = "pits-s0/__test-backup-interruption-arm";
-const BACKUP_FAULT_IN_FLIGHT_KEY = "pits-s0/__test-backup-interruption-in-flight";
 
 function fixtureText(context: TranscriptContext): { marker: string; toolState?: string } | undefined {
   let index = -1;
@@ -50,6 +49,7 @@ interface Env {
   PITS_ENABLE_FIXTURE?: string;
   PITS_ENABLE_MODEL?: string;
   PITS_TEST_REVISION?: string;
+  PITS_TEST_DEPLOYMENT?: string;
 }
 
 // Keep Sandbox 1.0's real DirectoryBackupGateway and R2 upload path. In the
@@ -62,9 +62,10 @@ export class DirectoryBackupGateway extends SandboxDirectoryBackupGateway {
     const env = this.env as Env;
     const props = this.ctx.props as { mode?: string; key?: string; uploadId?: string };
     const isPartUpload = request.method === "PUT" && new URL(request.url).pathname.startsWith("/parts/");
-    if (response.ok && isPartUpload && props.mode === "write" &&
-        env.PITS_ENABLE_FAULTS === "true" && await env.BACKUPS.head(BACKUP_FAULT_ARM_KEY)) {
-      await env.BACKUPS.put(BACKUP_FAULT_IN_FLIGHT_KEY, JSON.stringify({
+    const ownerPrefix = props.key?.match(/^pits-s0\/owners\/[a-f0-9]{64}\//)?.[0];
+    if (ownerPrefix && response.ok && isPartUpload && props.mode === "write" &&
+        env.PITS_TEST_DEPLOYMENT === "true" && env.PITS_ENABLE_FAULTS === "true" && await env.BACKUPS.head(ownerPrefix + "__test-backup-interruption-arm")) {
+      await env.BACKUPS.put(ownerPrefix + "__test-backup-interruption-in-flight", JSON.stringify({
         key: props.key, uploadId: props.uploadId, at: Date.now()
       }));
       await delay(3_000);
@@ -81,6 +82,7 @@ const CHECKPOINT_FAULT_STAGES: readonly FaultStage[] = ["during_backup", "after_
 
 export class PitsAgent extends DurableObject<Env> {
   private readonly runner: SandboxRunner;
+  private restoreInFlight?: Promise<unknown>;
   readonly ai = createAI({ binding: this.env.AI });
   readonly registry = createRegistry();
   readonly fixture = fauxProvider({
@@ -203,6 +205,13 @@ export class PitsAgent extends DurableObject<Env> {
     });
   }
   async restore() {
+    if (this.restoreInFlight) return this.restoreInFlight;
+    const pending = this.restoreWithHandoff();
+    this.restoreInFlight = pending;
+    try { return await pending; }
+    finally { this.restoreInFlight = undefined; }
+  }
+  private async restoreWithHandoff() {
     const session = this.harness.session();
     if (await session.busy()) throw new Error("Pi session must be idle before restoring a workspace");
     const checkpoint = await this.runner.restore();
@@ -216,6 +225,7 @@ export class PitsAgent extends DurableObject<Env> {
       "Re-inspect and re-verify relevant files. Workspace mutations remain blocked until the operator explicitly reconciles the restored checkpoint."
     ].join(" ");
     await session.reset(handoff);
+    await this.runner.completeRestoreHandoff(checkpoint.backup.id);
     return checkpoint;
   }
   async representativeFixture(files?: { path: string; base64: string }[]) {
@@ -225,6 +235,10 @@ export class PitsAgent extends DurableObject<Env> {
   async collectBackups(forTest = false) {
     if (forTest && !(await loadTestMode(this.ctx.storage)).faultsEnabled) throw new Error("Fault injection is disabled");
     return this.runner.collectOrphans(forTest);
+  }
+  async replaceContainerForRecovery() {
+    if (await this.harness.session().busy()) throw new Error("Pi session must be idle before container recovery");
+    return this.runner.replaceContainerForRecovery();
   }
   async readEvidence(path: string) { return this.runner.readEvidence(path); }
   async reconcile(checkpointId: string) { return this.runner.acknowledgeReconciliation(checkpointId); }
@@ -259,10 +273,12 @@ export class PitsAgent extends DurableObject<Env> {
     return this.runner.destroyForTest();
   }
   async ask(prompt: string) {
+    await this.runner.requireRestoreHandoffComplete();
     const result = await this.harness.prompt(prompt);
     return { text: result.text };
   }
   async askFixture(marker: string) {
+    await this.runner.requireRestoreHandoffComplete();
     if (!(await loadTestMode(this.ctx.storage)).fixtureEnabled) throw new Error("Deterministic fixture is disabled");
     if (!/^[a-z0-9-]{1,63}$/.test(marker)) throw new Error("Invalid fixture marker");
     const session = this.harness.session();
@@ -309,7 +325,13 @@ export default {
     const pathname = new URL(request.url).pathname;
     if (pathname === "/health") return Response.json({ service: "pits-s0" });
     // Fail closed: no default development token, no unauthenticated sandbox exec.
-    if (!env.PITS_API_TOKEN || request.headers.get("Authorization") !== "Bearer " + env.PITS_API_TOKEN) {
+    const supplied = request.headers.get("Authorization") ?? "";
+    const encoded = new TextEncoder();
+    const [actual, expected] = await Promise.all([
+      crypto.subtle.digest("SHA-256", encoded.encode(supplied)),
+      crypto.subtle.digest("SHA-256", encoded.encode("Bearer " + env.PITS_API_TOKEN))
+    ]);
+    if (!env.PITS_API_TOKEN || !timingSafeEqual(new Uint8Array(actual), new Uint8Array(expected))) {
       return new Response("Unauthorized", { status: 401 });
     }
     const expectedRevision = request.headers.get("X-PITS-Source-Revision");
@@ -317,6 +339,9 @@ export default {
       return Response.json({ error: "Test deployment revision has not converged" }, { status: 409 });
     }
     const testId = request.headers.get("X-PITS-Test-ID");
+    if ((testId !== null || pathname.startsWith("/api/test/")) && env.PITS_TEST_DEPLOYMENT !== "true") {
+      return new Response("Not found", { status: 404 });
+    }
     const testControlRequest = pathname === "/api/test/status" || pathname === "/api/test/enable" ||
       pathname === "/api/test/disable";
     let objectName = "s0";
@@ -418,6 +443,10 @@ export default {
           return new Response("Unknown test fault stage", { status: 400 });
         }
         return Response.json(await agent.checkpoint(body.faultAt as FaultStage | undefined));
+      }
+      if (pathname === "/api/recovery/replace-container") {
+        await agent.replaceContainerForRecovery();
+        return Response.json({ replaced: true, restoreRequired: true });
       }
       if (pathname === "/api/restore") return Response.json(await agent.restore());
       if (pathname === "/api/reconcile") {

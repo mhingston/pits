@@ -8,12 +8,11 @@ import {
   receiptWasInvalidated
 } from "./recovery.mjs";
 import { checkpointKey, ownerBackupPrefix, collectOwnedOrphans, ORPHAN_GRACE_MS, LEGACY_BACKUP_PREFIX } from "./backup-retention.mjs";
+import { loadTestMode } from "./test-mode.mjs";
 import { isSafeForegroundCommand, RUN, STATUS } from "./process-protocol.mjs";
 
 const ROOT = "/var/lib/pits-processes";
 const WORKSPACE = "/workspace/pits"; // Created after startup; directory restore works under wrangler dev.
-const BACKUP_FAULT_ARM_KEY = "pits-s0/__test-backup-interruption-arm";
-const BACKUP_FAULT_IN_FLIGHT_KEY = "pits-s0/__test-backup-interruption-in-flight";
 const TIMEOUT_MS = 20 * 60_000;
 const MAX_POLL_MS = 120_000;
 const POLL_MS = 750;
@@ -110,7 +109,8 @@ export class SandboxRunner {
   }
 
   private async ensureContainer(): Promise<{ bootId: string }> {
-    if (!this.container.running) {
+    const starting = !this.container.running;
+    if (starting) {
       this.container.start({
         image: this.container.images.sandbox,
         instance: "lite",
@@ -118,7 +118,17 @@ export class SandboxRunner {
       });
       await this.container.setInactivityTimeout(TIMEOUT_MS);
     }
-    const directory = await this.sh(["mkdir", "-p", WORKSPACE]);
+    // Probe startup before committing any new intent. Retrying this mkdir is
+    // safe: it cannot dispatch a command or change existing file contents.
+    const deadline = Date.now() + (starting ? 15_000 : 0);
+    let directory: Awaited<ReturnType<SandboxRunner["sh"]>>;
+    for (;;) {
+      try { directory = await this.sh(["mkdir", "-p", WORKSPACE]); break; }
+      catch (error) {
+        if (Date.now() >= deadline) throw error;
+        await delay(250);
+      }
+    }
     if (directory.exitCode !== 0) throw new Error("Cannot initialise workspace: " + directory.stderr);
     const bootId = (await this.sh(["cat", "/proc/sys/kernel/random/boot_id"])).stdout.trim();
     if (!bootId) throw new Error("Cannot establish container boot identity");
@@ -356,13 +366,14 @@ export class SandboxRunner {
   }
 
   private async cleanupInterruptedBackupUpload(): Promise<void> {
+    if (!(await loadTestMode(this.storage)).faultsEnabled) return;
     let pending = await this.storage.get<InterruptedBackupUpload>("test-backup-interruption-upload");
     if (!pending) {
-      const inFlight = await this.backupBucket.get(BACKUP_FAULT_IN_FLIGHT_KEY);
+      const inFlight = await this.backupBucket.get(this.backupPrefix + "__test-backup-interruption-in-flight");
       if (inFlight) pending = await inFlight.json<InterruptedBackupUpload>();
     }
     if (pending) {
-      if (!pending.key.startsWith("pits-s0/") || !pending.uploadId) {
+      if (!pending.key.startsWith(this.backupPrefix) || !pending.uploadId) {
         throw new Error("Refusing to clean up an invalid interrupted backup upload reference");
       }
       try {
@@ -376,8 +387,8 @@ export class SandboxRunner {
       await this.backupBucket.delete(pending.key);
       await this.storage.delete("test-backup-interruption-upload");
     }
-    await this.backupBucket.delete(BACKUP_FAULT_ARM_KEY);
-    await this.backupBucket.delete(BACKUP_FAULT_IN_FLIGHT_KEY);
+    await this.backupBucket.delete(this.backupPrefix + "__test-backup-interruption-arm");
+    await this.backupBucket.delete(this.backupPrefix + "__test-backup-interruption-in-flight");
   }
 
   async checkpoint(
@@ -404,7 +415,7 @@ export class SandboxRunner {
           "bs=1M", "count=64"
         ]);
         if (fixture.exitCode !== 0) throw new Error("Cannot prepare backup interruption fixture: " + fixture.stderr);
-        await this.backupBucket.put(BACKUP_FAULT_ARM_KEY, String(Date.now()));
+        await this.backupBucket.put(this.backupPrefix + "__test-backup-interruption-arm", String(Date.now()));
       }
       const gitState = await this.gitState();
       const options = {
@@ -418,10 +429,10 @@ export class SandboxRunner {
       if (faultAt === "during_backup") {
         const deadline = Date.now() + 30_000;
         while (!backupCompleted && Date.now() < deadline) {
-          const inFlight = await this.backupBucket.get(BACKUP_FAULT_IN_FLIGHT_KEY);
+          const inFlight = await this.backupBucket.get(this.backupPrefix + "__test-backup-interruption-in-flight");
           if (inFlight) {
             const upload = await inFlight.json<InterruptedBackupUpload>();
-            if (!upload.key?.startsWith("pits-s0/") || !upload.uploadId || !Number.isFinite(upload.at)) {
+            if (!upload.key?.startsWith(this.backupPrefix) || !upload.uploadId || !Number.isFinite(upload.at)) {
               throw new Error("DirectoryBackup gateway published an invalid in-flight R2 upload marker");
             }
             await this.storage.transaction(async tx => {
@@ -488,7 +499,6 @@ export class SandboxRunner {
   }
 
   async restore(): Promise<Checkpoint> {
-    await this.cleanupInterruptedBackupUpload();
     // Unlike snapshotting, a restore may follow an interrupted command on a
     // *different* container boot. Never restore over a live known process.
     await this.storage.transaction(async tx => {
@@ -496,9 +506,12 @@ export class SandboxRunner {
       await tx.put("maintenance", true);
     });
     try {
+      await this.cleanupInterruptedBackupUpload();
+      const { bootId } = await this.ensureContainer();
+      const pending = await this.storage.get<Checkpoint>("restore-handoff-pending");
+      if (pending && !(await this.storage.get<boolean>("restore-required"))) return pending;
       const point = await this.storage.get<Checkpoint>("checkpoint");
       if (!point) throw new Error("No committed backup");
-      const { bootId } = await this.ensureContainer();
       const active = await this.storage.get<string>("active");
       if (active) {
         const intent = await this.storage.get<Intent>("intent:" + active);
@@ -506,6 +519,11 @@ export class SandboxRunner {
           throw new Error("Cannot restore over a possibly running command in this boot");
         }
       }
+      // Persist the unsafe state before any destructive filesystem operation.
+      await this.storage.transaction(async tx => {
+        await tx.put("restore-required", true);
+        await tx.put("restore-handoff-pending", point);
+      });
       await this.directoryBackup(point.backupPrefix ?? LEGACY_BACKUP_PREFIX).restore(point.backup);
       await this.storage.transaction(async tx => {
         await tx.delete("active");
@@ -513,8 +531,15 @@ export class SandboxRunner {
         const ceiling = await tx.get<number>("command-sequence") ?? 0;
         const lostRanges = await tx.get<{ afterSequence: number; throughSequence: number }[]>("lost-sequence-ranges") ?? [];
         await tx.put("lost-sequence-ranges", addLostSequenceRange(lostRanges, point.sequence, ceiling));
-        await tx.put("restore-floor-sequence", point.sequence);
-        await tx.put("restore-ceiling-sequence", ceiling);
+        const floor = await tx.get<number>("restore-floor-sequence");
+        const oldCeiling = await tx.get<number>("restore-ceiling-sequence");
+        if (floor !== undefined && oldCeiling !== undefined) {
+          await tx.put("lost-sequence-ranges", addLostSequenceRange(
+            addLostSequenceRange(lostRanges, point.sequence, ceiling), floor, oldCeiling));
+        }
+        await tx.delete("restore-floor-sequence");
+        await tx.delete("restore-ceiling-sequence");
+        await tx.put("restore-handoff-pending", point);
         await tx.put("reconciliation-required", true);
         await tx.put("restored-checkpoint", point);
       });
@@ -522,6 +547,30 @@ export class SandboxRunner {
     } finally {
       await this.storage.delete("maintenance");
     }
+  }
+
+  async replaceContainerForRecovery(): Promise<void> {
+    await this.storage.transaction(async tx => {
+      if (await tx.get<boolean>("maintenance")) throw new Error("Maintenance already running");
+      const active = await tx.get<string>("active");
+      if (!active || !(await tx.get<boolean>("no-redispatch:" + active))) throw new Error("No ambiguous command to recover");
+      await tx.put("maintenance", true);
+      await tx.put("restore-required", true);
+    });
+    try { await this.container.destroy(); }
+    finally { await this.storage.delete("maintenance"); }
+  }
+
+  async completeRestoreHandoff(checkpointId: string): Promise<void> {
+    await this.storage.transaction(async tx => {
+      const pending = await tx.get<Checkpoint>("restore-handoff-pending");
+      if (!pending || pending.backup.id !== checkpointId) throw new Error("Restore handoff mismatch");
+      await tx.delete("restore-handoff-pending");
+    });
+  }
+
+  async requireRestoreHandoffComplete(): Promise<void> {
+    if (await this.storage.get("restore-handoff-pending")) throw new Error("Restore transcript handoff pending; retry restore");
   }
 
   private async gitState(): Promise<{ head: string | null; tree: string | null; status: string }> {
@@ -562,7 +611,8 @@ export class SandboxRunner {
         }
         for (const file of files) {
           const path = WORKSPACE + "/" + file.path;
-          await this.sh(["mkdir", "-p", path.slice(0, path.lastIndexOf("/"))]);
+          const directory = await this.sh(["mkdir", "-p", path.slice(0, path.lastIndexOf("/"))]);
+          if (directory.exitCode !== 0) throw new Error("Cannot create repository fixture directory: " + directory.stderr);
           const bytes = Uint8Array.from(atob(file.base64), char => char.charCodeAt(0));
           const proc = await this.container.exec(["tee", path], {
             stdin: new ReadableStream({ start(controller) { controller.enqueue(bytes); controller.close(); } }),
@@ -613,6 +663,7 @@ export class SandboxRunner {
   }
 
   async acknowledgeReconciliation(checkpointId: string): Promise<void> {
+    await this.requireRestoreHandoffComplete();
     const point = await this.storage.get<Checkpoint>("restored-checkpoint");
     if (!point || point.backup.id !== checkpointId) throw new Error("Checkpoint mismatch");
     if (await this.storage.get<boolean>("restore-required")) throw new Error("Restore still required");
@@ -634,7 +685,7 @@ export class SandboxRunner {
     const storedBackupUpload = await this.storage.get<InterruptedBackupUpload>("test-backup-interruption-upload");
     const backupInFlightObject = storedBackupUpload
       ? null
-      : await this.backupBucket.get(BACKUP_FAULT_IN_FLIGHT_KEY);
+      : (await loadTestMode(this.storage)).faultsEnabled ? await this.backupBucket.get(this.backupPrefix + "__test-backup-interruption-in-flight") : null;
     const backupInFlight = storedBackupUpload ??
       (backupInFlightObject ? await backupInFlightObject.json<InterruptedBackupUpload>() : null);
     return {

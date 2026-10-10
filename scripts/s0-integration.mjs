@@ -48,7 +48,7 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const sha256 = value => createHash("sha256").update(value).digest("hex");
 const redact = value => String(value)
   .replaceAll(token, "[REDACTED]")
-  .replace(accessCookie ?? "\u0000", "[ACCESS-REDACTED]")
+  .replaceAll(accessCookie ?? "\u0000", "[ACCESS-REDACTED]")
   .replace(/("(?:cf-connecting-ip|x-real-ip|x-forwarded-for)"\s*:\s*")[^"]+(\")/gi,
     (match, prefix, suffix) => prefix + "[IP-REDACTED]" + suffix)
   .replace(/(Bearer\s+)[^\s"']+/gi, "$1[REDACTED]");
