@@ -35,6 +35,8 @@ const sha256 = value => createHash("sha256").update(value).digest("hex");
 const redact = value => String(value)
   .replaceAll(token, "[REDACTED]")
   .replace(accessCookie ?? "\u0000", "[ACCESS-REDACTED]")
+  .replace(/("(?:cf-connecting-ip|x-real-ip|x-forwarded-for)"\s*:\s*")[^"]+(\")/gi,
+    (match, prefix, suffix) => prefix + "[IP-REDACTED]" + suffix)
   .replace(/(Bearer\s+)[^\s"']+/gi, "$1[REDACTED]");
 
 function record(scenario, fields = {}) {
@@ -233,19 +235,27 @@ try {
   record("preflight", { pass: true, containerBootId: current.boot ?? null, pi: current.pi ?? null });
 
   // Drive an actual pi-durable task with a zero-cost deterministic pi-ai provider.
-  const fixtureMarker = `pi-${testId}`;
+  // Keep the Pi-issued tool process alive long enough to observe it in the same
+  // DO/container pair before aborting the DO. This avoids sampling Pi's pending
+  // alarm before its first shell tool has reserved or started the container.
+  const fixtureMarker = `replace-pi-${testId}`;
   const fixturePending = request("/api/ask-fixture", { marker: fixtureMarker });
   const duringFixture = await waitForState(
-    value => value.pi.pendingCount > 0 && value.pi.lifecycleAlarm !== null,
-    "PiHarness pending operation and Lifecycle alarm"
+    value => value.pi.pendingCount > 0 && value.pi.lifecycleAlarm !== null &&
+      Boolean(value.activeIntent) && value.processObservation?.kind === "running" && Boolean(value.boot),
+    "PiHarness pending operation, Lifecycle alarm, and its running sandbox tool"
   );
   const fixtureBoot = duringFixture.boot;
+  const fixtureCommandId = duringFixture.activeIntent.id;
+  assert.ok(fixtureBoot, "Pi sandbox tool must already have started its container");
   const abortedFixture = await request("/api/abort", {});
   assert.notEqual(abortedFixture.status, 200, "test abort resets the DO instance");
   await fixturePending;
   const recoveredFixture = expectStatus(await request("/api/ask-fixture", { marker: fixtureMarker }), 200, "reattach Pi fixture");
   assert.match(recoveredFixture.text, new RegExp(`fixture complete ${fixtureMarker}`));
   assert.ok(recoveredFixture.command?.commandId, "Pi tool result retains its command receipt");
+  assert.equal(recoveredFixture.command.commandId, fixtureCommandId,
+    "PiHarness recovery reattaches the command running before DO abort");
   assert.equal(recoveredFixture.command.state, "exited");
   const fixtureEffects = await markerCount("pi-fixture.txt", fixtureMarker);
   assert.equal(fixtureEffects, 1, "PiHarness tool caused exactly one filesystem append");
