@@ -10,6 +10,7 @@ import { SandboxRunner } from "./runner";
 import type { FaultStage } from "./runner";
 import { loadTestMode, storeTestMode, type TestMode } from "./test-mode.mjs";
 
+const CHECKPOINT_PROTOCOL = "owner-retention-git-generation-v3";
 const FIXTURE_PROMPT = /^pits-fixture:([a-z0-9-]{1,63})$/;
 const PI_REOBSERVE_DEADLINE_MS = 4 * 60_000;
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -244,7 +245,7 @@ export class PitsAgent extends DurableObject<Env> {
     };
   }
   async testStatus() {
-    return { ...await loadTestMode(this.ctx.storage), sourceRevision: this.env.PITS_TEST_REVISION ?? null };
+    return { ...await loadTestMode(this.ctx.storage), checkpointProtocol: CHECKPOINT_PROTOCOL };
   }
   async enableTestMode(mode: TestMode) {
     return storeTestMode(this.ctx.storage, mode);
@@ -333,7 +334,7 @@ export default {
     try {
       if (objectName !== "s0" && !testControlRequest) {
         const mode = await agent.testStatus();
-        if (expectedRevision && mode.sourceRevision !== expectedRevision) {
+        if (expectedRevision && mode.checkpointProtocol !== CHECKPOINT_PROTOCOL) {
           return Response.json({ error: "Test deployment revision has not converged" }, { status: 409 });
         }
         if (!mode.faultsEnabled && !mode.fixtureEnabled) return new Response("Not found", { status: 404 });
