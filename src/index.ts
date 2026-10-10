@@ -91,8 +91,10 @@ export class PitsAgent extends DurableObject<Env> {
             name: "sandbox_bash",
             description: "Execute a bounded foreground command in the isolated workspace. Never launch detached processes.",
             parameters: Type.Object({ command: Type.String({ minLength: 1, maxLength: 4096 }) }),
-            // Re-enable safe replay only after the live S0 crash tests pass.
-            replay: "unsafe",
+            // Pi re-enters the adapter after eviction using this durable task ID.
+            // The runner reattaches a same-boot reservation/receipt and only
+            // dispatches when reservation absence proves the command never started.
+            replay: "safe",
             executionMode: "sequential",
             execute: async ({ command }, api) => {
               const result = await this.runner.execute(String(api.taskId), command);

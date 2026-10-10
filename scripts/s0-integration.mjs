@@ -9,6 +9,7 @@ import { execFileSync } from "node:child_process";
 const baseUrl = process.env.PITS_URL;
 const token = process.env.PITS_API_TOKEN;
 const accessCookie = process.env.PITS_ACCESS_COOKIE;
+const workerName = process.env.PITS_WORKER_NAME ?? "pits-s0-test";
 const iterations = Number(process.env.PITS_ITERATIONS ?? 10);
 const testId = process.env.PITS_TEST_ID ??
   `${new Date().toISOString().replace(/[^0-9]/g, "").slice(0, 14)}-${randomBytes(4).toString("hex")}`;
@@ -21,7 +22,7 @@ assert.ok(Number.isInteger(iterations) && iterations >= 10 && iterations <= 100,
 const base = new URL(baseUrl);
 assert.equal(base.protocol, "https:", "Live integration tests require HTTPS");
 assert.ok(!["localhost", "127.0.0.1", "::1"].includes(base.hostname), "Local emulation is not live Cloudflare evidence");
-assert.ok(base.hostname.startsWith("pits-s0-test."), "PITS_URL must target the isolated pits-s0-test hostname");
+assert.ok(base.hostname.startsWith(`${workerName}.`), `PITS_URL must target the isolated ${workerName} hostname`);
 
 mkdirSync(dirname(artifactPath), { recursive: true });
 mkdirSync(dirname(logsPath), { recursive: true });
@@ -29,7 +30,7 @@ const sourceCommit = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf
 const lock = JSON.parse(readFileSync(new URL("../package-lock.json", import.meta.url), "utf8"));
 const versions = Object.fromEntries(["@cloudflare/sandbox", "agents", "@earendil-works/pi-durable", "@earendil-works/pi-ai", "wrangler"]
   .map(name => [name, lock.packages[`node_modules/${name}`]?.version ?? "unknown"]));
-const common = { testId, sourceCommit, versions, containerImage: "cloudflare/sandbox:1.0.0" };
+const common = { testId, worker: workerName, sourceCommit, versions, containerImage: "cloudflare/sandbox:1.0.0" };
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const sha256 = value => createHash("sha256").update(value).digest("hex");
 const redact = value => String(value)
@@ -115,11 +116,10 @@ let logChild;
 let logTail = "";
 let logStatus = "not-started";
 function startCloudflareLogs() {
-  const worker = "pits-s0-test";
   const env = { ...process.env };
   delete env.PITS_API_TOKEN;
   delete env.PITS_ACCESS_COOKIE;
-  logChild = spawn("npx", ["wrangler", "tail", worker, "--format", "json"], {
+  logChild = spawn("npx", ["wrangler", "tail", workerName, "--format", "json"], {
     cwd: process.cwd(), env, stdio: ["ignore", "pipe", "pipe"]
   });
   logChild.stdout.setEncoding("utf8");
@@ -226,7 +226,7 @@ let cleanupAttempted = false;
 try {
   const enabled = await deployTestWorker(true, true);
   assert.equal(enabled.code, 0, `could not enable isolated test switches: ${enabled.output}`);
-  record("test-switches-enabled", { pass: true, worker: "pits-s0-test", deploymentExitCode: enabled.code });
+  record("test-switches-enabled", { pass: true, worker: workerName, deploymentExitCode: enabled.code });
   startCloudflareLogs();
   const health = expectStatus(await request("/health", undefined, { auth: false }), 200, "health");
   assert.equal(health.service, "pits-s0");
@@ -526,7 +526,7 @@ try {
     const deployment = await deployTestWorker(true, true);
     assert.equal(deployment.code, 0, `test Worker redeployment failed: ${deployment.output}`);
     record("redeploy-during-active-command", {
-      pass: true, worker: "pits-s0-test", deployDurationMs: Date.now() - deployStartedAt,
+      pass: true, worker: workerName, deployDurationMs: Date.now() - deployStartedAt,
       deploymentExitCode: deployment.code, commandId: active.activeIntent.id,
       classificationAtDeployStart: "running", bootIdBefore: before.boot,
       bootIdAtDeployStart: active.boot
