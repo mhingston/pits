@@ -257,7 +257,8 @@ try {
   while (Date.now() - routingStartedAt < 120_000) {
     const response = await request("/api/test/status");
     if (response.status === 200 && response.body.faultsEnabled === true &&
-      response.body.fixtureEnabled === true && response.body.objectName === `test-${testId}` &&
+      response.body.fixtureEnabled === true && response.body.workerFaultsEnabled === true &&
+      response.body.workerFixtureEnabled === true && response.body.objectName === `test-${testId}` &&
       response.body.requestedTestId === testId) {
       routing = response.body;
       break;
@@ -279,7 +280,14 @@ try {
   // DO/container pair before aborting the DO. This avoids sampling Pi's pending
   // alarm before its first shell tool has reserved or started the container.
   const fixtureMarker = `replace-pi-${testId}`;
-  const fixturePending = request("/api/ask-fixture", { marker: fixtureMarker });
+  const fixturePending = request("/api/ask-fixture", { marker: fixtureMarker }).then(response => {
+    record("piharness-request-settled", {
+      pass: response.status === 200,
+      status: response.status,
+      command: resultSummary(response.body?.command)
+    });
+    return response;
+  });
   const duringFixture = await waitForState(
     value => value.pi.pendingCount > 0 && value.pi.lifecycleAlarm !== null &&
       Boolean(value.activeIntent) && value.processObservation?.kind === "running" && Boolean(value.boot),

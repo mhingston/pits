@@ -214,6 +214,12 @@ export class PitsAgent extends DurableObject<Env> {
       }
     };
   }
+  async testStatus() {
+    return {
+      faultsEnabled: this.env.PITS_ENABLE_FAULTS === "true",
+      fixtureEnabled: this.env.PITS_ENABLE_FIXTURE === "true"
+    };
+  }
   async destroyForTest() { return this.runner.destroyForTest(); }
   async ask(prompt: string) {
     const result = await this.harness.prompt(prompt);
@@ -276,16 +282,18 @@ export default {
       // destructive integration run a clean Durable Object identity.
       objectName = "test-" + testId;
     }
-    if (pathname === "/api/test/status" && request.method === "GET") {
-      return Response.json({
-        faultsEnabled: env.PITS_ENABLE_FAULTS === "true",
-        fixtureEnabled: env.PITS_ENABLE_FIXTURE === "true",
-        objectName,
-        requestedTestId: request.headers.get("X-PITS-Test-ID")
-      });
-    }
     const agent = env.PITS.getByName(objectName);
     try {
+      if (pathname === "/api/test/status" && request.method === "GET") {
+        const durableObject = await agent.testStatus();
+        return Response.json({
+          ...durableObject,
+          workerFaultsEnabled: env.PITS_ENABLE_FAULTS === "true",
+          workerFixtureEnabled: env.PITS_ENABLE_FIXTURE === "true",
+          objectName,
+          requestedTestId: request.headers.get("X-PITS-Test-ID")
+        });
+      }
       if (pathname === "/api/evidence" && request.method === "GET") {
         const path = new URL(request.url).searchParams.get("path");
         if (!path) return new Response("Missing path", { status: 400 });
