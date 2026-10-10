@@ -400,6 +400,7 @@ try {
     assert.match(fixture.gitState.status, /\?\? untracked-fixture.txt/, "untracked state is recorded");
     // Protect both the current checkpoint and the older restored checkpoint.
     const newer = expectStatus(await request("/api/checkpoint", {}), 200, "new checkpoint for retention");
+    assert.equal(newer.generation, checkpoint.generation + 1, "checkpoint generation advances atomically");
     await invokeCheckpointFault("after_backup_before_checkpoint");
     assert.equal((await state()).checkpoint.backup.id, newer.backup.id);
     await sleep(1000);
@@ -548,6 +549,7 @@ try {
   });
   const checkpointStarted = Date.now();
   const checkpoint = expectStatus(await request("/api/checkpoint", {}), 200, "initial checkpoint");
+  assert.equal(checkpoint.generation, 1, "first committed checkpoint has generation one");
   assert.ok(checkpoint.backup.size > 0);
   assert.match(checkpoint.backup.sha256, /^[a-f0-9]{64}$/);
   const checkpointDurationMs = Date.now() - checkpointStarted;

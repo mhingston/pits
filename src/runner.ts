@@ -42,6 +42,7 @@ interface Checkpoint {
   commandId: string | null;
   createdAt: number;
   sequence: number;
+  generation?: number;
   gitState?: { head: string | null; tree: string | null; status: string };
   transcriptAnchor?: {
     sessionId: string;
@@ -429,7 +430,11 @@ export class SandboxRunner {
         sequence: await this.storage.get<number>("command-sequence") ?? 0,
         ...(transcriptAnchor ? { transcriptAnchor } : {})
       };
-      await this.storage.put("checkpoint", point);
+      await this.storage.transaction(async tx => {
+        point.generation = (await tx.get<number>("checkpoint-generation") ?? 0) + 1;
+        await tx.put("checkpoint-generation", point.generation);
+        await tx.put("checkpoint", point);
+      });
       // Collection failure does not roll back a committed checkpoint; it is
       // recorded and retried by the next checkpoint or explicit maintenance.
       try { await this.collectOrphansLocked(Date.now() - ORPHAN_GRACE_MS); }
