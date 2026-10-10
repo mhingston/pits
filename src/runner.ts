@@ -552,13 +552,13 @@ export class SandboxRunner {
           if ((await proc.output()).exitCode !== 0) throw new Error("Cannot write repository fixture file");
         }
         const result = await this.sh(["sh", "-ec", `
+          git init -q
+          git add .
+          git -c user.name=S0 -c user.email=s0@example.invalid commit -qm repository-fixture
           mkdir -p node_modules .cache
           dd if=/dev/urandom of=node_modules/excluded.bin bs=1M count=64
           printf excluded > node_modules/excluded.txt
           printf excluded > .cache/excluded.txt
-          git init -q
-          git add . ":(exclude)node_modules/" ":(exclude).cache/"
-          git -c user.name=S0 -c user.email=s0@example.invalid commit -qm repository-fixture
           printf '\nS0 dirty tracked fixture\n' >> README.md
           printf 'untracked fixture\n' > untracked-fixture.txt
           dd if=/dev/urandom of=fixture-large.bin bs=1M count=64
