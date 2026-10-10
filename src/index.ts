@@ -276,6 +276,14 @@ export default {
       // destructive integration run a clean Durable Object identity.
       objectName = "test-" + testId;
     }
+    if (pathname === "/api/test/status" && request.method === "GET") {
+      return Response.json({
+        faultsEnabled: env.PITS_ENABLE_FAULTS === "true",
+        fixtureEnabled: env.PITS_ENABLE_FIXTURE === "true",
+        objectName,
+        requestedTestId: request.headers.get("X-PITS-Test-ID")
+      });
+    }
     const agent = env.PITS.getByName(objectName);
     try {
       if (pathname === "/api/evidence" && request.method === "GET") {

@@ -252,6 +252,22 @@ try {
   assert.equal(enabled.code, 0, `could not enable isolated test switches: ${enabled.output}`);
   record("test-switches-enabled", { pass: true, worker: workerName, deploymentExitCode: enabled.code });
   startCloudflareLogs();
+  const routingStartedAt = Date.now();
+  let routing;
+  while (Date.now() - routingStartedAt < 120_000) {
+    const response = await request("/api/test/status");
+    if (response.status === 200 && response.body.faultsEnabled === true &&
+      response.body.fixtureEnabled === true && response.body.objectName === `test-${testId}` &&
+      response.body.requestedTestId === testId) {
+      routing = response.body;
+      break;
+    }
+    await sleep(1_000);
+  }
+  assert.ok(routing, "test Worker deployment did not become active with the requested Durable Object routing");
+  record("test-routing-ready", {
+    pass: true, objectName: routing.objectName, propagationWaitMs: Date.now() - routingStartedAt
+  });
   const health = expectStatus(await request("/health", undefined, { auth: false }), 200, "health");
   assert.equal(health.service, "pits-s0");
   assert.equal((await request("/api/state", undefined, { auth: false })).status, 401, "API rejects missing bearer token");
