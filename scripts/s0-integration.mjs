@@ -385,6 +385,7 @@ try {
     });
     for (let i = 0; i < iterations; i++) {
       const before = await state();
+      const faultStartedAt = Date.now();
       const fault = await invokeCheckpointFault(onlyCheckpointFault);
       const after = await state();
       record("backup-fault-observation", {
@@ -410,7 +411,7 @@ try {
         checkpointId: after.checkpoint.backup.id, checkpointSha256: after.checkpoint.backup.sha256,
         size: after.checkpoint.backup.size, bootIdBefore: before.boot, bootIdAfter: after.boot,
         interruptionAt: after.backupInterruptionFiredAt, mutationFixtureBytes: 64 * 1024 * 1024,
-        recoveryDurationMs: Date.now() - before.backupInterruptionFiredAt
+        recoveryDurationMs: Date.now() - faultStartedAt
       });
       // Let the isolated gateway's one-shot response hold expire before the
       // next backup starts; this keeps each multipart interruption distinct.
