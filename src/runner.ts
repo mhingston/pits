@@ -327,7 +327,11 @@ export class SandboxRunner {
   }
 
   private async cleanupInterruptedBackupUpload(): Promise<void> {
-    const pending = await this.storage.get<InterruptedBackupUpload>("test-backup-interruption-upload");
+    let pending = await this.storage.get<InterruptedBackupUpload>("test-backup-interruption-upload");
+    if (!pending) {
+      const inFlight = await this.backupBucket.get(BACKUP_FAULT_IN_FLIGHT_KEY);
+      if (inFlight) pending = await inFlight.json<InterruptedBackupUpload>();
+    }
     if (pending) {
       if (!pending.key.startsWith("pits-s0/") || !pending.uploadId) {
         throw new Error("Refusing to clean up an invalid interrupted backup upload reference");
@@ -353,7 +357,7 @@ export class SandboxRunner {
   ): Promise<Checkpoint> {
     await this.beginMaintenance();
     try {
-      if (faultAt === "during_backup") await this.cleanupInterruptedBackupUpload();
+      await this.cleanupInterruptedBackupUpload();
       const { bootId } = await this.ensureContainer();
       if (await this.storage.get<boolean>("restore-required") ||
           await this.storage.get<boolean>("reconciliation-required")) {
@@ -390,8 +394,10 @@ export class SandboxRunner {
             if (!upload.key?.startsWith("pits-s0/") || !upload.uploadId || !Number.isFinite(upload.at)) {
               throw new Error("DirectoryBackup gateway published an invalid in-flight R2 upload marker");
             }
-            await this.storage.put("test-backup-interruption-upload", upload);
-            await this.storage.put("test-backup-interruption-fired-at", upload.at);
+            await this.storage.transaction(async tx => {
+              await tx.put("test-backup-interruption-upload", upload);
+              await tx.put("test-backup-interruption-fired-at", upload.at);
+            });
             await this.ctx.abort("pits fault injection: during R2 multipart backup", { retryAlarm: false });
             await new Promise<void>(() => {});
           }
@@ -490,14 +496,21 @@ export class SandboxRunner {
     const processObservation = active
       ? await this.status(active).catch(() => ({ kind: "unknown" as const }))
       : null;
+    const storedBackupUpload = await this.storage.get<InterruptedBackupUpload>("test-backup-interruption-upload");
+    const backupInFlightObject = storedBackupUpload
+      ? null
+      : await this.backupBucket.get(BACKUP_FAULT_IN_FLIGHT_KEY);
+    const backupInFlight = storedBackupUpload ??
+      (backupInFlightObject ? await backupInFlightObject.json<InterruptedBackupUpload>() : null);
     return {
       boot,
       containerRunning: this.container.running,
       active,
       activeIntent: active ? await this.storage.get<Intent>("intent:" + active) : null,
       processObservation,
-      backupInterruptionFiredAt: await this.storage.get<number>("test-backup-interruption-fired-at") ?? null,
-      backupInterruptionPartUploaded: Boolean(await this.storage.get<InterruptedBackupUpload>("test-backup-interruption-upload")),
+      backupInterruptionFiredAt: await this.storage.get<number>("test-backup-interruption-fired-at") ??
+        backupInFlight?.at ?? null,
+      backupInterruptionPartUploaded: Boolean(backupInFlight),
       restoreRequired: (await this.storage.get<boolean>("restore-required")) ?? false,
       reconciliationRequired: (await this.storage.get<boolean>("reconciliation-required")) ?? false,
       commandSequence: await this.storage.get<number>("command-sequence") ?? 0,
